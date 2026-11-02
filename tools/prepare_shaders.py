@@ -25,9 +25,9 @@ RETRIES times, and skips them.
 
 Game-derived output stays in the build directory (ignored). The list is read at preparation time from tools/data/shader_list.tsv when that file exists (the installer archive
 bundles it; it stays out of the repository), else from refs/ through git with the rows its history dropped
-(tools/shader_list.py); nothing of it is copied into the repository. Needs Python 3.14 (compression.zstd), so run it in .venv-py314 or the embeddable 3.14:
+(tools/shader_list.py); nothing of it is copied into the repository. Needs Python 3.14 (compression.zstd), so run it in .venv or the embeddable 3.14:
 
-    .venv-py314\\Scripts\\python tools\\prepare_shaders.py build\\v121 [--version v121] [--list <tsv>] [--no-run]
+    .venv\\Scripts\\python tools\\prepare_shaders.py build\\v121 [--version v121] [--list <tsv>] [--no-run]
                                                      [--romfs DIR --exefs DIR]   # instead of build\\extracted\\<version>
 """
 import argparse

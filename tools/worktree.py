@@ -4,7 +4,7 @@
   worktree.py list                         worktrees with branch, ahead/behind main, dirty or not
   worktree.py remove <tag> [--delete-branch] [--force]
 
-A worktree holds tracked files only. build/, generated/, refs/, toolchain/, .venv/, .venv-py314/, game/, and the local
+A worktree holds tracked files only. build/, generated/, refs/, toolchain/, .venv/, game/, and the local
 agent setup .claude/ and notes/ of the main checkout appear in it as directory junctions, config.local.toml and
 CLAUDE.local.md as hard links. Nothing is copied.
 `remove` deletes the links first (os.rmdir / os.unlink never follow a junction), checks that none is left, and only
@@ -17,7 +17,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-LINK_DIRS = ['build', 'generated', 'refs', 'toolchain', '.venv', '.venv-py314', 'game', '.claude', 'notes']
+LINK_DIRS = ['build', 'generated', 'refs', 'toolchain', '.venv', 'game', '.claude', 'notes']
 LINK_FILES = ['config.local.toml', 'CLAUDE.local.md']
 MAIN_BRANCH = 'main'
 TAG_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]*$')

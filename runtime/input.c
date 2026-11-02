@@ -677,6 +677,31 @@ int input_rumble(uint16_t low, uint16_t high, uint32_t ms) {
     return ok;
 }
 
+int input_rumble_hd(float left_low_amplitude, float left_low_frequency,
+                    float left_high_amplitude, float left_high_frequency,
+                    float right_low_amplitude, float right_low_frequency,
+                    float right_high_amplitude, float right_high_frequency,
+                    uint32_t ms) {
+    int ok = 0;
+    static int triggers = -1;
+    static unsigned seen;
+    if (triggers < 0 || seen != cfg_version()) seen = cfg_version(), triggers = input_rumble_triggers_enabled();
+    plat_mutex_lock(&lock);
+    if (state == 1 && pad && pad_rumble) {
+        ok = SDL_RumbleGamepadFrequenciesEx(pad,
+                                             left_low_amplitude, left_low_frequency,
+                                             left_high_amplitude, left_high_frequency,
+                                             right_low_amplitude, right_low_frequency,
+                                             right_high_amplitude, right_high_frequency, ms);
+        if (triggers) {
+            float trigger_a = right_high_amplitude > left_high_amplitude ? right_high_amplitude : left_high_amplitude;
+            SDL_RumbleGamepadTriggers(pad, rumble_motor(trigger_a, 1, 1), rumble_motor(trigger_a, 1, 1), ms);
+        }
+    }
+    plat_mutex_unlock(&lock);
+    return ok;
+}
+
 // SDL gamepad sensor axes (SDL_sensor.h, a gamepad held in front of you): x to the right, y up out of the face (lying
 // flat face up, +y points at the ceiling), z toward the player (out of the bottom edge). The accelerometer reads the
 // push against gravity in m/s^2 (lying flat: y = +9.81); the gyro reads rad/s, counter-clockwise positive (right hand).

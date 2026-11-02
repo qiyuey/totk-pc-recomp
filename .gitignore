@@ -4,7 +4,6 @@
 # Downloaded toolchain binaries and Python environments
 /toolchain/
 /.venv/
-/.venv-py314/
 __pycache__/
 
 # Personal paths to game files and keys

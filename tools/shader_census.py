@@ -12,9 +12,9 @@ build/<version>/shaders/ only:
     spv/<key>.spv       with --translate
     failures.txt        with --translate, when something failed: groups by message
 
-The key is sha256(control[:0x880] + code), as in MNG. Needs Python 3.14 (compression.zstd), so run in .venv-py314:
+The key is sha256(control[:0x880] + code), as in MNG. Needs Python 3.14 (compression.zstd), so run in .venv:
 
-    .venv-py314\\Scripts\\python tools\\shader_census.py --version v121 --translate
+    .venv\\Scripts\\python tools\\shader_census.py --version v121 --translate
 """
 import argparse
 import compression.zstd as zstd

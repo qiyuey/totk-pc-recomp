@@ -17,7 +17,7 @@ The button guide in play (bottom right) draws L and ZL from images of the common
 (timg/__Combined.bntx, Nt_KeyTexL_00 and Nt_KeyTexZL_00): bntx_redraw paints the same icons into them, the size
 unchanged. The sticks keep the Switch icons, and so do prompts drawn as fixed images (some tutorial animations).
 
-Needs fontTools (tools/requirements-installer.txt, tools/requirements-py314.txt).
+Needs fontTools (tools/requirements-installer.txt, tools/requirements.txt).
 """
 import io
 import struct

@@ -94,6 +94,33 @@ CLANG = UCRT / 'clang.exe' if WIN else on_path('clang')
 NINJA = UCRT / 'ninja.exe' if WIN else on_path('ninja')
 SDL3_DLLS = [UCRT / 'SDL3.dll', UCRT / 'libiconv-2.dll', UCRT / 'libopus-0.dll'] if WIN else []
 
+
+# Keep the workspace HD-rumble SDL headers, import library and DLL together. Never silently link the system SDL.
+SDL3_INCLUDE = None
+SDL3_LINK = None
+
+
+def configure_sdl3(dlls):
+    """Select the user's SDL build after --deps, so release dependencies cannot replace it."""
+    global SDL3_INCLUDE, SDL3_LINK
+    workspace_sdl = ROOT.parent / 'SDL3'
+    release = workspace_sdl / 'build' / 'windows-x64-release' / 'Release'
+    SDL3_INCLUDE = Path(os.environ.get('TOTK_SDL3_INCLUDE', workspace_sdl / 'include')).resolve()
+    lib_dir = Path(os.environ.get('TOTK_SDL3_LIB', release)).resolve()
+    candidates = ('SDL3.lib', 'libSDL3.dll.a') if WIN else ('libSDL3.so', 'libSDL3.a')
+    SDL3_LINK = next((lib_dir / name for name in candidates if (lib_dir / name).is_file()), None)
+    dll = Path(os.environ.get('TOTK_SDL3_DLL', release / 'SDL3.dll')).resolve() if WIN else None
+    header = SDL3_INCLUDE / 'SDL3' / 'SDL_gamepad.h'
+    if not header.is_file() or 'SDL_RumbleGamepadFrequenciesEx' not in header.read_text(encoding='utf-8'):
+        sys.exit('Custom SDL3 HD-rumble headers required; set TOTK_SDL3_INCLUDE to your SDL3 include directory')
+    if SDL3_LINK is None:
+        sys.exit(f'Custom SDL3 library missing in {lib_dir}; set TOTK_SDL3_LIB to its library directory')
+    if WIN and not dll.is_file():
+        sys.exit(f'Custom SDL3 DLL missing: {dll}; set TOTK_SDL3_DLL to the matching DLL')
+    print(f'build_game: custom SDL3: {SDL3_INCLUDE}, {SDL3_LINK}' + (f', {dll}' if dll else ''))
+    return [p for p in dlls if p.name.lower() != 'sdl3.dll'] + [dll] if WIN else dlls
+
+
 # Flags for generated code as LAS Recomp builds it (Makefile GENFLAGS, Windows), plus -march for the FP/SIMD lowering.
 # --cpu v2 replaces the level for CPUs without AVX2/FMA; runtime/fma.c then supplies the correctly rounded fma the
 # lowering needs (runtime/simd.h).
@@ -342,8 +369,9 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
     inc = f'-I {cmd_path(RUNTIME)} -I {cmd_path(gen)}'
     vma = f'{cmd_path(DEPS / "include")} -I {cmd_path(DEPS / "include" / "vma")}' if DEPS else cmd_path(vma_include())
     imgui = cmd_path(RUNTIME / 'third_party' / 'imgui')
-    rt_inc = f'{inc} -I {cmd_path(out)} -I {vma} -I {imgui}'   # romfs_config.h, vk_mem_alloc.h (+ deps headers), imgui.h
+    rt_inc = f'{inc} -I {cmd_path(SDL3_INCLUDE)} -I {cmd_path(out)} -I {vma} -I {imgui}'   # romfs_config.h, vk_mem_alloc.h (+ deps headers), imgui.h
     libs = [f'-L {cmd_path(DEPS / "lib")}'] + (LLVM_LINK_LIBS if WIN else LINK_LIBS) if DEPS else LINK_LIBS
+    libs = [cmd_path(SDL3_LINK) if lib == '-lSDL3' else lib for lib in libs]
     # A compiler cache (sccache) may front clang: every lift rewrites the generated chunks with the same contents, so
     # the cached objects save the compile step on the next build.
     cache = f'{cmd_arg(os.environ["SCCACHE"])} ' if os.environ.get('SCCACHE') else ''
@@ -807,6 +835,7 @@ def main():
     if args.toolchain and WIN or args.deps and (args.toolchain or not WIN):   # Linux: --deps only, never deps-mingw
         DEPS = (args.deps or DEFAULT_DEPS).resolve()
         dlls = sorted((DEPS / 'bin').glob('*.dll')) if WIN else []
+    dlls = configure_sdl3(dlls)
     if DEPS and not WIN:
         # A release (--deps): Opus, libvpx and zstd go into the executable, so it needs no more than libc, Vulkan and
         # the libSDL3.so.0 beside it
@@ -917,7 +946,7 @@ def main():
         print(f'{below_root(exe)}: {mib(exe.stat().st_size)}')
         return
     for dll in dlls:   # dynamic SDL3 (zlib) and its libiconv (LGPL, unmodified DLL), found next to totk.exe
-        shutil.copy2(dll, exe.parent / dll.name)
+        shutil.copy2(dll, exe.parent / ('SDL3.dll' if dll == dlls[-1] and WIN else dll.name))
     sections, image = pe_sections(exe) if WIN else elf_sections(exe)
     print(f'{below_root(exe)}: file {mib(exe.stat().st_size)}, '
           f'image {mib(image)}; ' + ', '.join(f'{k} {mib(v)}' for k, v in sections.items() if k.startswith('.') and v))

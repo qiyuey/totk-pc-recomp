@@ -18,7 +18,7 @@ Versions are the ones the build was verified with; newer patch releases are fine
 | Visual Studio Build Tools | 2026, C++ workload, Windows SDK 10.0.26100 | winget `Microsoft.VisualStudio.BuildTools` with `--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended` | the linker .NET NativeAOT calls |
 | .NET SDK | 10.0 | winget `Microsoft.DotNet.SDK.10` | the shader translator (`totk_xlate.exe`) |
 | Vulkan SDK | 1.4.363 | winget `KhronosGroup.VulkanSDK` | validation layers, `vulkaninfo` |
-| uv | 0.13 | standalone installer from astral.sh | the two Python environments |
+| uv | 0.13 | standalone installer from astral.sh | the Python environment |
 | hactool | 1.4.0 @ `1d64a83` | `.venv\Scripts\python tools\build_hactool.py`, see below | NCA and update extraction |
 
 MSYS2 packages, after `pacman -Syuu` (run it twice; the first pass updates the core and exits):
@@ -51,20 +51,32 @@ PATH:
 
 hactool reads `-k <prod.keys>`; MSYS2 shells set `HOME`, which hides its default key location, so pass `-k` there.
 
+## Custom SDL3 with HD rumble
+
+This workspace build requires the custom SDL3 frequency-band API. On Windows, `tools/build_game.py` uses
+`../SDL3/include` and `../SDL3/build/windows-x64-release/Release/SDL3.lib` and `SDL3.dll` by default.
+Override them together with `TOTK_SDL3_INCLUDE` (the directory containing `SDL3/`), `TOTK_SDL3_LIB`
+(the directory containing `SDL3.lib` or `libSDL3.dll.a`) and `TOTK_SDL3_DLL` (the matching DLL).
+These settings also override SDL from `--deps`; all other upstream dependency and toolchain choices stay intact.
+Missing custom headers or libraries stop the build instead of silently using stock SDL. Linux builds require
+`TOTK_SDL3_INCLUDE` and `TOTK_SDL3_LIB` pointing to a matching custom Linux SDL build.
+
+Game vibration keeps the left/right low/high amplitudes and frequencies through `ov_input.c`, `input.c`, and
+`SDL_RumbleGamepadFrequenciesEx`. The custom SDL driver handles conventional pads. The runtime retains upstream
+controller discovery, polling, thread locking, rumble settings and optional trigger effects.
+
 ## Build
 
 From the repository root, in PowerShell. Every step that depends on the game version takes it as `<ver>`: `v143` for
 1.4.3, `v121` for 1.2.1 or `v110` for 1.1.0. The tools default to `v121` when `--version` is left out. Saves load on any
 of them.
 
-1. Python environments (once). `.venv` runs the lifter and the build; `.venv-py314` runs the extraction scripts, which
-   need the stdlib `compression.zstd` of Python 3.14:
+1. Create one Python 3.14 environment for the lifter, build, extraction, shaders and tests. Extraction and shader
+   scripts need the stdlib `compression.zstd`:
 
    ```powershell
-   uv venv --python 3.12 .venv
+   uv venv --python 3.14 .venv
    uv pip install --python .venv/Scripts/python.exe -r tools/requirements.txt
-   uv venv --python 3.14 .venv-py314
-   uv pip install --python .venv-py314/Scripts/python.exe -r tools/requirements-py314.txt
    ```
 
 2. Copy `config.example.toml` to `config.local.toml` and set the paths to your base game, the update and your console's
@@ -75,7 +87,7 @@ of them.
    `extracted` goes there instead, and `build_game.py` reads the ExeFS and RomFS from there:
 
    ```powershell
-   .venv-py314\Scripts\python tools\extract.py
+   .venv\Scripts\python tools\extract.py
    ```
 
 4. Shader translator (no game files; again after a change to its sources, and `tools\make_release.py` stops on an older
@@ -90,7 +102,7 @@ of them.
 
    ```powershell
    .venv\Scripts\python recomp\gen.py --exefs build\extracted\<ver>\exefs --out generated\<ver> --patches recomp\patches-<ver>.txt
-   .venv-py314\Scripts\python tools\make_romfs_patches.py --version <ver>
+   .venv\Scripts\python tools\make_romfs_patches.py --version <ver>
    .venv\Scripts\python tools\build_game.py --version <ver>
    ```
 
@@ -121,7 +133,7 @@ of them.
    for the shared shader list:
 
    ```powershell
-   .venv-py314\Scripts\python tools\prepare_shaders.py build\<ver> --version <ver>
+   .venv\Scripts\python tools\prepare_shaders.py build\<ver> --version <ver>
    ```
 
    Without this step the first launch compiles shaders and pipelines during play and stutters until the caches fill.
@@ -201,7 +213,7 @@ Before a commit:
 - `build\<ver>\totk.exe --selftest`: layout, dispatch table and host-function registry, without game files.
 
 A change to the button prompts (`tools/make_romfs_patches.py --prompts`, `tools/button_icons.py`) passes
-`.venv-py314\Scripts\python tests\romfs_prompts_test.py`, which runs the tool on a RomFS it makes itself (no game
+`.venv\Scripts\python tests\romfs_prompts_test.py`, which runs the tool on a RomFS it makes itself (no game
 files); a change to the settings passes `totk.exe --probe-cfg`.
 
 The lifter (`recomp/`) and the CPU headers (`runtime/cpu.h`, `runtime/simd.h`) are checked against Unicorn. Every lifter
@@ -225,7 +237,7 @@ Runtime probes, each a mode of `totk.exe` (the list is at the top of `runtime/ma
 part of `--probe-vkexec` translate shaders of the census below: they look for `build/<ver>/shaders/jobs.json` of the
 exe's own version first, then of the other one.
 
-Shaders: `.venv-py314\Scripts\python tools\shader_census.py --version <ver> --translate` extracts every Maxwell shader
+Shaders: `.venv\Scripts\python tools\shader_census.py --version <ver> --translate` extracts every Maxwell shader
 to `build\<ver>\shaders\` and runs it through the translator and `spirv-val`; failure groups go to `failures.txt`.
 `tools\xlate_smoke.py` checks the translator alone, without game files.
 

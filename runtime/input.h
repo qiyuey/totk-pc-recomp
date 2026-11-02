@@ -49,9 +49,14 @@ int input_flight_key(void);
 void input_cursor_suspend(int on);
 int input_cursor_released(void);   // Esc or a non-client activation released the cursor (probe)
 
-// Rumble: SDL_RumbleGamepad on the open gamepad, low (heavy, left) and high (light, right) motor 0..65535 for ms
-// milliseconds. 1 if a gamepad with rumble took it. Callable from any thread.
+// Rumble: HD frequency/amplitude bands from the game to SDL3. Amplitudes are 0..1 and frequencies are Hz.
+// The fallback path reduces them to SDL's conventional low/high motors. 1 if a gamepad with rumble took it.
 int input_rumble(uint16_t low, uint16_t high, uint32_t ms);
+int input_rumble_hd(float left_low_amplitude, float left_low_frequency,
+                    float left_high_amplitude, float left_high_frequency,
+                    float right_low_amplitude, float right_low_frequency,
+                    float right_high_amplitude, float right_high_frequency,
+                    uint32_t ms);
 // Motor value for a normalised amplitude: pow(a, curve) * strength, saturated to 0..65535. Pure.
 uint16_t rumble_motor(float a, float curve, float strength);
 // TOTK_RUMBLE_TRIGGERS=1: input_rumble also drives the impulse triggers (Xbox) with the high motor's value.

@@ -5,7 +5,7 @@ stays byte for byte, the same input gives the same output, and a RomFS the tool 
 writes anything. Both game versions: 1.2.1 (Common.Product.110, 72x72 button guide images) and 1.4.3
 (Common.Product.140, 108x108).
 
-Run: .venv-py314\\Scripts\\python tests\\romfs_prompts_test.py
+Run: .venv\\Scripts\\python tests\\romfs_prompts_test.py
 """
 import compression.zstd as zstd
 import hashlib

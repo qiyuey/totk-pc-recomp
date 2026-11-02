@@ -10,7 +10,7 @@ Steps 1 and 3 run for every file in `input.updates`. Each update's version is id
 not by its file name. Output: build/extracted/v0/{exefs,romfs} and build/extracted/v<version>/{exefs,romfs}.
 
 --base, --update, --keys and --work name the files and the output directory instead of the config (the installer
-imports the functions instead). Runs under .venv-py314. Key values are read by the tools from the keys file and never
+imports the functions instead). Runs under .venv. Key values are read by the tools from the keys file and never
 printed.
 """
 import argparse

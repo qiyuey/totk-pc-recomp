@@ -22,7 +22,7 @@ This repository is public. Game data lives outside it and every derived file sta
 ## Code
 
 - Build C with MSYS2 UCRT64 Clang (`C:\msys64\ucrt64\bin`). Generated C uses GNU extensions, so `cl.exe` is out. Call Ninja from that directory by full path or put it first on PATH.
-- Two Python environments: `.venv` (3.12) for the lifter and the build, `.venv-py314` for the extraction and shader scripts, which need `compression.zstd`.
+- Use one Python 3.14 environment, `.venv`, for the lifter, build, extraction, shaders and tests. Install `tools/requirements.txt`; extraction and shader scripts need the stdlib `compression.zstd`.
 - Generated C is never edited by hand: change the generator (`recomp/`).
 - Every lifter change passes the differential tests against Unicorn ([docs/building.md](docs/building.md), "Checks"). After changing `recomp/jumptables.py`, `tests\jumptables_check.py` reports 0 disagreements on 1.2.1 and 1.4.3.
 - `recomp/layout.py` alone decides module bases.

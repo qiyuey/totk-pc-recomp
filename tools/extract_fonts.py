@@ -7,7 +7,7 @@ firmware NCA directory (an unpacked firmware, or an emulator's installed `regist
 values are never printed. Every NCA FS header, all six IVFC levels and each BFTTF header are verified
 (tools/vendor/macnativegames/extract_shared_fonts.py).
 
-Runs under .venv-py314:  python tools\\extract_fonts.py --firmware <dir>   (or set input.firmware in config.local.toml)
+Runs under .venv:  python tools\\extract_fonts.py --firmware <dir>   (or set input.firmware in config.local.toml)
 """
 import argparse
 import sys

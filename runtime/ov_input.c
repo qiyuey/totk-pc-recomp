@@ -1,7 +1,7 @@
 // Adapted from MacNativeGames games/totk/runtime/input.c and hid_feedback.c @ b75be8cf (MIT, Copyright (c) 2026
 // MacNativeGames contributors).
 // nn::hid overrides: one connected controller fed by input_poll (gamepad and keyboard,
-// runtime/input_win.c; nothing pressed with TOTK_INPUT=none). Docked (default) it is a full-key controller as player 1 (id 0, style bit 0); with
+// runtime/input.c; nothing pressed with TOTK_INPUT=none). Docked (default) it is a full-key controller as player 1 (id 0, style bit 0); with
 // TOTK_OPERATION_MODE=handheld it is the handheld controller (id 0x20, style bit 1) and player 1 is not connected,
 // which is the controller the game reads in that mode. Mouse and keyboard report no input. The controller has two
 // vibration devices (left, right) played on the gamepad's motors (TOTK_RUMBLE=0: none) and a six-axis sensor fed by
@@ -207,7 +207,6 @@ static void rumble_cfg(void) {
     if (!plat_xchg32(&rumble_cfg_logged, 1))
         rt_log("hid: rumble strength %.0f%%, curve %.2f, triggers %s", rumble_strength * 100, rumble_curve, trig ? "on" : "off");
 }
-static uint16_t motor(float a) { return rumble_motor(a, rumble_curve, rumble_strength); }
 
 static uint32_t pad_style_index(void) { return ov_handheld() ? STYLE_INDEX_HANDHELD : STYLE_INDEX_FULL_KEY; }
 
@@ -287,35 +286,31 @@ static int vibration_side(const uint32_t *h, const char *fn) {
 static PlatMutex vib_lock = PLAT_MUTEX_INIT;
 static VibrationValue vib_last[2] = {{0, 160, 0, 320}, {0, 160, 0, 320}};   // vib_lock
 static uint64_t vib_at[2], sent_at;                                          // vib_lock
-static uint16_t sent_low, sent_high;                                         // vib_lock
+static VibrationValue sent_vib[2];                                           // vib_lock
+static int sent_valid;                                                        // vib_lock
 static int vib_allowed = 1;                                                  // vib_lock: PermitVibration
 
 static float clamp01(float v) { return v > 0 ? (v < 1 ? v : 1) : 0; }   // NaN -> 0
-// Share of a band at f Hz that goes to the light (high-frequency, right) motor: none at 160 Hz and below (the low band's
-// neutral frequency), all at 320 Hz and above (the high band's), log scale between.
-static float light_share(float f) { return f > 160 ? (f < 320 ? log2f(f / 160) : 1) : 0; }
-
-// Switch HD rumble -> SDL_RumbleGamepad. Each side's two bands split by frequency between the heavy (low) and the light
-// (high) motor (light_share) and add up as energy per motor (root of the summed squares); the stronger side drives each
-// motor. A side the game has not updated for 250 ms is silent. Each send lasts 250 ms and is renewed every 50 ms while
-// the game streams, so the pad stops by itself when the game stops sending (pause, freeze). Under vib_lock.
+// Switch HD rumble -> SDL_RumbleGamepadFrequenciesEx. Preserve both sides, amplitudes and frequencies end-to-end;
+// SDL's fallback handles pads that only expose conventional low/high motors. A side the game has not updated for 250 ms
+// is silent. Each send lasts 250 ms and is renewed every 50 ms while the game streams, so the pad stops by itself when
+// the game stops sending (pause, freeze). Under vib_lock.
 static void rumble_update(uint64_t now) {
-    float heavy = 0, light = 0;
+    VibrationValue v[2] = {vib_neutral, vib_neutral};
     rumble_cfg();
     for (int s = 0; s < 2 && vib_allowed; s++) {
         if (!vib_at[s] || now - vib_at[s] > RUMBLE_STALE_NS) continue;
-        const VibrationValue *v = &vib_last[s];
-        float al = clamp01(v->amp_low), ah = clamp01(v->amp_high), sl = light_share(v->freq_low), sh = light_share(v->freq_high);
-        float h = sqrtf(al * (1 - sl) * al * (1 - sl) + ah * (1 - sh) * ah * (1 - sh));
-        float l = sqrtf(al * sl * al * sl + ah * sh * ah * sh);
-        if (h > heavy) heavy = h;
-        if (l > light) light = l;
+        v[s] = vib_last[s];
     }
-    uint16_t lo = motor(clamp01(heavy)), hi = motor(clamp01(light));
-    int changed = lo != sent_low || hi != sent_high, on = lo || hi;
+    int changed = !sent_valid || memcmp(v, sent_vib, sizeof v) != 0;
+    int on = v[0].amp_low > 0 || v[0].amp_high > 0 || v[1].amp_low > 0 || v[1].amp_high > 0;
     if (changed ? on && now - sent_at < RUMBLE_MIN_GAP_NS : !on || now - sent_at < RUMBLE_REFRESH_NS) return;
-    input_rumble(lo, hi, on ? RUMBLE_MS : 0);
-    sent_low = lo, sent_high = hi, sent_at = now;
+    input_rumble_hd(clamp01(powf(clamp01(v[0].amp_low), rumble_curve) * rumble_strength), v[0].freq_low,
+                    clamp01(powf(clamp01(v[0].amp_high), rumble_curve) * rumble_strength), v[0].freq_high,
+                    clamp01(powf(clamp01(v[1].amp_low), rumble_curve) * rumble_strength), v[1].freq_low,
+                    clamp01(powf(clamp01(v[1].amp_high), rumble_curve) * rumble_strength), v[1].freq_high,
+                    on ? RUMBLE_MS : 0);
+    memcpy(sent_vib, v, sizeof v), sent_valid = 1, sent_at = now;
 }
 
 static void play(int side, const VibrationValue *v) {

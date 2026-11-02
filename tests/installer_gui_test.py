@@ -1,6 +1,6 @@
 """The installer window: event model, form, catalogs, cancel, a self-closing Tk run and one end-to-end run.
 
-    .venv-py314\\Scripts\\python tests\\installer_gui_test.py
+    .venv\\Scripts\\python tests\\installer_gui_test.py
 
 The end-to-end test runs the real CLI in --verify mode on a finished install (every step skips) and folds its events
 through the same code the window uses (the fixture's step keys are recomputed for the checkout under test, because the keys fingerprint recomp/, tools/ and runtime/). The install is build/inst-gui/e2e-install: hard links to build/install-test, so
