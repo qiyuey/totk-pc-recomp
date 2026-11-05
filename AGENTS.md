@@ -29,6 +29,10 @@ This repository is public. Game data lives outside it and every derived file sta
 - Graphics bugs: [docs/maxwell.md](docs/maxwell.md) lists the Maxwell behaviour the Vulkan path must match and the TotK bugs other ports fixed.
 - Comments say what the code does and why, in words that stand on their own. Cite our code by file plus function (a line number may follow as a hint) and upstream code by project, file and function: `refs/` moves, so its line numbers rot. Commit hashes belong to the attribution of copied code.
 
+## Fork maintenance
+
+Use ordinary focused commits in the personal fork. `origin` is `qiyuey/totk-pc-recomp`; `upstream` is the original `valentderah/totk-pc-recomp` repository. Follow [docs/FORK-MAINTENANCE.md](docs/FORK-MAINTENANCE.md). Preserve the historical FIX and recovery refs; do not amend it automatically or force-push published history. Integrate upstream only when requested, retaining custom SDL3 support. Push only to the personal fork when publication is requested. The single local FIX workflow no longer applies.
+
 ## Writing
 
 Code, comments, docs and commit messages are in English. Commit messages are plain sentences without type prefixes.
