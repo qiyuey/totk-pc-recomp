@@ -31,7 +31,10 @@ typedef struct {
     // without them), the render thread's waits for pipeline builds, shader translation and texture uploads, and the
     // textures uploaded
     float replay_ms, gpu_ms, pipe_wait_ms, xlate_ms, tex_ms, tex_uploads;
+    int build_active[2];                       // shader translation, driver pipeline creation
+    uint64_t build_finished[2];                 // includes failed attempts; activity, not a success count
 } PerfStats;
+void perf_build_snapshot(int active[2], uint64_t finished[2]);
 
 // Overlay mode 0 off, 1 fps, 2 full (TOTK_PERF_OVERLAY), from the present path when the setting changes. Full starts
 // the machine sampling thread (twice a second) and turns on the event counts and GPU timestamps; leaving full stops

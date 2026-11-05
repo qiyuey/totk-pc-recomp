@@ -24,6 +24,22 @@ __attribute__((weak)) void prof_sampler_frame(uint64_t frame, uint64_t now, uint
 
 // TOTK_TRACE=perf, TOTK_FLIGHT=1 or the full performance overlay: event counts are taken. Wait times are always taken
 // (frame-time summary). perf_base: the part fixed at start.
+static int build_active[PERF_BUILD_N];
+static uint64_t build_finished[PERF_BUILD_N];
+void perf_build_begin(int kind) {
+    __atomic_add_fetch(&build_active[kind], 1, __ATOMIC_RELAXED);
+}
+void perf_build_end(int kind) {
+    __atomic_add_fetch(&build_finished[kind], 1, __ATOMIC_RELAXED);
+    __atomic_sub_fetch(&build_active[kind], 1, __ATOMIC_RELAXED);
+}
+void perf_build_snapshot(int active[2], uint64_t finished[2]) {
+    for (int i = 0; i < PERF_BUILD_N; i++) {
+        active[i] = __atomic_load_n(&build_active[i], __ATOMIC_RELAXED);
+        finished[i] = __atomic_load_n(&build_finished[i], __ATOMIC_RELAXED);
+    }
+}
+
 static int perf_on, perf_base;
 static int overlay;   // performance overlay mode (perf_set_overlay): 0 off, 1 fps, 2 full
 

@@ -402,6 +402,9 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_RESET_CONFIRM] = "Reset every setting to its default?", [UI_MENU_RESET_YES] = "Reset",
     [UI_MENU_RESET_NO] = "Cancel",
 
+    [UI_MENU_OV_BUILD_SHADER] = "Compiling shaders: %d",
+    [UI_MENU_OV_BUILD_PIPE] = "Building pipelines: %d",
+    [UI_MENU_OV_BUILD_RECENT] = "Recent graphics preparation",
     [UI_MENU_OV_FPS] = "%.0f FPS", [UI_MENU_OV_FRAME_MS] = "%.1f ms", [UI_MENU_OV_GAME_PCT] = "game %.0f%%",
     [UI_MENU_OV_MAX_MS] = "max %.1f ms",
     [UI_MENU_OV_GPU] = "GPU", [UI_MENU_OV_CPU] = "CPU", [UI_MENU_OV_RAM] = "RAM", [UI_MENU_OV_VRAM] = "VRAM",
@@ -1346,6 +1349,9 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
 // when the menu language is zh-Hans (ui_text.h menu_text). The rows are fixed width, so the strings stay close to the
 // English length; an id without a Chinese entry falls back to English.
 static const char *const text_zh_hans[UI_TEXT_COUNT] = {
+    [UI_MENU_OV_BUILD_SHADER] = "正在编译着色器：%d",
+    [UI_MENU_OV_BUILD_PIPE] = "正在构建图形管线：%d",
+    [UI_MENU_OV_BUILD_RECENT] = "刚刚进行了图形准备",
     SWKBD("文字输入", "请输入名字", "马儿", "确定", "取消", "手柄：A 确定，B 取消"),
 
     [UI_MENU_TITLE] = "设置",

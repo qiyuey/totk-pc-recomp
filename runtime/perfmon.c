@@ -353,5 +353,6 @@ void perfmon_snapshot(PerfStats *out) {
     frames_summary(&g_stats, now);
     counters_summary(now);
     *out = g_stats;
+    perf_build_snapshot(out->build_active, out->build_finished);
     plat_mutex_unlock(&g_lock);
 }

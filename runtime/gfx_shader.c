@@ -1390,7 +1390,9 @@ static const GfxShader *translate(const Req *r, int stage, const uint8_t *contro
     int away = kern_core_away();
     const uint8_t *id = r->final ? r->key : r->code_hash;
     flight_enter(id);
+    perf_build_begin(PERF_BUILD_SHADER);
     const GfxShader *s = translate_one(r, stage, control, code, a);
+    perf_build_end(PERF_BUILD_SHADER);
     flight_leave(id);
     kern_core_back(&away);
     return s;

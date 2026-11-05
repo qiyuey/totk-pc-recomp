@@ -1440,7 +1440,9 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
     if (k->fbl & 1) pi.flags |= VK_PIPELINE_CREATE_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
     if (k->fbl & 2) pi.flags |= VK_PIPELINE_CREATE_DEPTH_STENCIL_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
     uint64_t p0 = perf_begin();
+    perf_build_begin(PERF_BUILD_PIPE);
     VkResult r = vkCreateGraphicsPipelines(P.device, P.cache, 1, &pi, NULL, &pipe);
+    perf_build_end(PERF_BUILD_PIPE);
     perf_end(PERF_PIPE, p0);   // counts on the render thread only, so background builds stay out of it
     if (r != VK_SUCCESS) {
         rt_log("vk_pipeline: vkCreateGraphicsPipelines failed (%d)", (int)r);
@@ -1591,7 +1593,9 @@ static VkPipeline lib_create(int kind, const VkPipeState *s, const GKey *k, VkPi
         ri.depthAttachmentFormat = (VkFormat)k->depth, ri.stencilAttachmentFormat = (VkFormat)k->stencil;
         pi.pColorBlendState = &cb, pi.pMultisampleState = &ms;
     }
+    perf_build_begin(PERF_BUILD_PIPE);
     if (vkCreateGraphicsPipelines(P.device, P.cache, 1, &pi, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
+    perf_build_end(PERF_BUILD_PIPE);
 out:
     if (m) vkDestroyShaderModule(P.device, m, NULL);
     free(patched);
@@ -1783,7 +1787,9 @@ static VkPipeline gpl_link(const VkPipeState *s, const GKey *k, const Layout *lc
                                            .layout = l->layout};
         if (build) plat_mutex_unlock(&P.lock);
         uint64_t t1 = qpc();
+        perf_build_begin(PERF_BUILD_PIPE);
         if (vkCreateGraphicsPipelines(P.device, VK_NULL_HANDLE, 1, &pi, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
+        perf_build_end(PERF_BUILD_PIPE);
         double ms = ms_since(t1);   // the link alone: library builds are counted apart
         if (build) plat_mutex_lock(&P.lock);
         P.g.link_ms += ms;
@@ -2523,7 +2529,9 @@ static VkPipeline compute_create(const GfxShader *cs, const Layout *l) {
                                       .layout = l->layout};
     pin_subgroup32(&ci.stage, &rqc, code, words);
     VkPipeline pipe = VK_NULL_HANDLE;
+    perf_build_begin(PERF_BUILD_PIPE);
     if (vkCreateComputePipelines(P.device, P.cache, 1, &ci, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
+    perf_build_end(PERF_BUILD_PIPE);
     vkDestroyShaderModule(P.device, m, NULL);
     return pipe;
 }
