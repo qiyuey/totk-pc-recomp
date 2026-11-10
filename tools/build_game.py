@@ -118,7 +118,29 @@ def configure_sdl3(dlls):
     if WIN and not dll.is_file():
         sys.exit(f'Custom SDL3 DLL missing: {dll}; set TOTK_SDL3_DLL to the matching DLL')
     print(f'build_game: custom SDL3: {SDL3_INCLUDE}, {SDL3_LINK}' + (f', {dll}' if dll else ''))
-    return [p for p in dlls if p.name.lower() != 'sdl3.dll'] + [dll] if WIN else dlls
+    if not WIN:
+        return dlls
+    dependencies = [p for p in dlls if p.name.lower() not in ('sdl3.dll', 'libusb-1.0.dll')]
+    # The custom SDL loads libusb dynamically, so import-table dependency scans
+    # cannot find it. Use the same package's configured library, not a PATH DLL.
+    usb_override = os.environ.get('TOTK_SDL3_LIBUSB_DLL')
+    usb_dll = Path(usb_override).resolve() if usb_override else dll.parent / 'libusb-1.0.dll'
+    required = bool(usb_override)
+    cache = lib_dir.parent / 'CMakeCache.txt'
+    if not usb_override and cache.is_file():
+        entries = cache.read_text(encoding='utf-8')
+        required = 'SDL_HIDAPI_LIBUSB_SHARED:BOOL=ON' in entries
+        library = next((line.split('=', 1)[1] for line in entries.splitlines()
+                        if line.startswith('LibUSB_LIBRARY:')), None)
+        if library and not usb_dll.is_file():
+            usb_dll = Path(library).parent / 'libusb-1.0.dll'
+    if required and not usb_dll.is_file():
+        sys.exit('Matching libusb runtime missing; set TOTK_SDL3_LIBUSB_DLL')
+    if usb_dll.is_file():
+        dependencies.append(usb_dll)
+        dependencies.append(ROOT / 'runtime/third_party/libusb/libusb-COPYING.txt')
+    # The final entry is SDL3: the post-link copier uses that to normalize its name.
+    return dependencies + [dll]
 
 
 # Flags for generated code as LAS Recomp builds it (Makefile GENFLAGS, Windows), plus -march for the FP/SIMD lowering.

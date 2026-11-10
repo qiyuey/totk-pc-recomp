@@ -146,7 +146,7 @@ static const CfgMeta metas[] = {
     {"ASSUME_FOCUS", "1", "0|1", LIVE},   // read on every focus change (ov_system.c)
     // Sound, Controls, Menu
     {"VOLUME", "100", "0..100", LIVE}, {"AUDIO_CHANNELS", "stereo", "auto|stereo|5.1", RESTART},
-    {"MOTION", "1", "0|1", LIVE}, {"RUMBLE_STRENGTH", "130", "0..300", LIVE}, {"RUMBLE_CURVE", "0.6", "0.2..1.5", LIVE},
+    {"MOTION", "1", "0|1", LIVE}, {"RUMBLE_STRENGTH", "50", "0..100", LIVE}, {"RUMBLE_CURVE", "1", "0.2..1.5", LIVE},
     {"RUMBLE_TRIGGERS", "0", "0|1", LIVE}, {"PAD_LAYOUT", "auto", "auto|nintendo|xbox", LIVE},
     {"PROMPTS", "nintendo", "nintendo|xbox|pc", RESTART},
     {"STICK_DEADZONE", "8", "0..50", LIVE}, {"STICK_SENS", "1", "0.1..3", RESTART},

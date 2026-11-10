@@ -35,6 +35,9 @@ static volatile int32_t g_kbm_last = 1;
 int input_kbm_last(void) { return __atomic_load_n(&g_kbm_last, __ATOMIC_RELAXED); }
 static SDL_Gamepad *pad;
 static uint64_t next_scan;
+static volatile int32_t rumble_epoch;
+static volatile int32_t rumble_foreground = -1;
+static int rumble_ready_state = -1;
 static int pad_rumble;               // the open gamepad has rumble motors
 static volatile int32_t pad_labels[4];  // ... and the labels of its south, east, west, north buttons (PAD_LABEL_*), any thread
 static int pad_east_a;               // ... and labels its east face button A (Nintendo layout under TOTK_PAD_LAYOUT=auto)
@@ -400,6 +403,7 @@ static void stick(SDL_GamepadAxis ax, SDL_GamepadAxis ay, float dead, int32_t ou
 static void scan_pads(void) {
     if (pad && SDL_GamepadConnected(pad)) return;
     if (pad) {
+        plat_inc32(&rumble_epoch);
         SDL_CloseGamepad(pad); pad = NULL; sensor_pad = 0; sensor_ok = 0;
         plat_xchg32(&pad_layout_shown, -1);
         for (int i = 0; i < 4; i++) plat_xchg32(&pad_labels[i], PAD_LABEL_NONE);
@@ -410,6 +414,7 @@ static void scan_pads(void) {
     for (int i = 0; ids && i < n && !pad; i++) pad = SDL_OpenGamepad(ids[i]);
     SDL_free(ids);
     if (!pad) return;
+    plat_inc32(&rumble_epoch);
     pad_rumble = SDL_GetBooleanProperty(SDL_GetGamepadProperties(pad), SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false);
     pad_east_a = SDL_GetGamepadButtonLabel(pad, SDL_GAMEPAD_BUTTON_EAST) == SDL_GAMEPAD_BUTTON_LABEL_A;
     for (int i = 0; i < 4; i++) {
@@ -501,6 +506,7 @@ static void start(void) {
     binds_refresh();
     const char *e = cfg_get("TOTK_INPUT");
     if (e && !strcmp(e, "none")) { state = -1; rt_log("input: disabled (TOTK_INPUT=none)"); return; }
+    SDL_SetHintWithPriority("SDL_JOYSTICK_HIDAPI_SWITCH2_EXPERIMENTAL_HD", "1", SDL_HINT_DEFAULT);
     if (!SDL_Init(SDL_INIT_GAMEPAD)) { state = -1; rt_log("input: SDL gamepad init failed (%s), keyboard only", SDL_GetError()); }
     else state = 1;
     if (state == 1) test_pad_attach();
@@ -835,17 +841,62 @@ int input_rumble(uint16_t low, uint16_t high, uint32_t ms) {
     return ok;
 }
 
-int input_rumble_hd(float left_low_amplitude, float left_low_frequency,
+uint32_t input_rumble_generation(void) {
+    // Focus/config observation does not take the SDL device lock. Stamp fresh
+    // publications after a focus transition, not when the worker notices it later.
+    const char *enabled = cfg_get("TOTK_RUMBLE");
+    int on = ikb_foreground() && (!enabled || strcmp(enabled, "0"));
+    int previous = plat_xchg32(&rumble_foreground, on);
+    if (previous >= 0 && previous != on) plat_inc32(&rumble_epoch);
+    return (uint32_t)plat_cas32(&rumble_epoch, 0, 0);
+}
+
+int input_rumble_service(uint32_t *generation) {
+    plat_mutex_lock(&lock);
+    if (!state) start();
+    if (state == 1) {
+        SDL_UpdateGamepads();
+        uint64_t now = kern_now_ns();
+        if (pad || now >= next_scan) {
+            scan_pads();
+            next_scan = now + (uint64_t)RESCAN_MS * 1000000;
+        }
+    }
+    *generation = input_rumble_generation();
+    int ready = state == 1 && pad && pad_rumble && plat_cas32(&rumble_foreground, 0, 0);
+    if (!ready && rumble_ready_state == 1 && pad)
+        SDL_RumbleGamepadFrequenciesEx(pad, 0, 160, 0, 320, 0, 160, 0, 320, 0);
+    rumble_ready_state = ready;
+    plat_mutex_unlock(&lock);
+    return ready;
+}
+
+void input_rumble_shutdown_device(void) {
+    plat_mutex_lock(&lock);
+    if (pad) {
+        SDL_RumbleGamepadFrequenciesEx(pad, 0, 160, 0, 320, 0, 160, 0, 320, 0);
+        SDL_CloseGamepad(pad); pad = NULL;
+    }
+    if (state == 1) SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
+    state = 2;
+    sensor_pad = 0; sensor_ok = 0;
+    plat_inc32(&rumble_epoch);
+    plat_mutex_unlock(&lock);
+}
+
+int input_rumble_hd_epoch(float left_low_amplitude, float left_low_frequency,
                     float left_high_amplitude, float left_high_frequency,
                     float right_low_amplitude, float right_low_frequency,
                     float right_high_amplitude, float right_high_frequency,
-                    uint32_t ms) {
-    int ok = 0;
+                    uint32_t ms, uint32_t generation) {
+    int ok = -1;
     static int triggers = -1;
     static unsigned seen;
     if (triggers < 0 || seen != cfg_version()) seen = cfg_version(), triggers = input_rumble_triggers_enabled();
     plat_mutex_lock(&lock);
-    if (state == 1 && pad && pad_rumble) {
+    uint32_t current = input_rumble_generation();
+    if (state == 1 && pad && pad_rumble && SDL_GamepadConnected(pad) &&
+        (generation == current || (!generation && current == 1))) {
         ok = SDL_RumbleGamepadFrequenciesEx(pad,
                                              left_low_amplitude, left_low_frequency,
                                              left_high_amplitude, left_high_frequency,

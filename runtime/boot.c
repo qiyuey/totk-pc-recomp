@@ -20,8 +20,10 @@
 #include "gfx.h"
 #include "mods.h"
 #include "nvn_api.h"
+#include "input.h"
 #include "platform/platform.h"
 #include "vk.h"
+#include "input.h"
 #include "platform/platform.h"
 
 #define SYM_INIT_START "_ZN2nn4init5StartEmmPFvvES2_S2_"
@@ -136,6 +138,7 @@ void rt_boot_event(const char *what, Cpu *c, const char *detail) {
         stats_line();
         fflush(stdout);
         fflush(stderr);
+        input_vibration_shutdown();
         plat_exit(0);   // other guest threads are still running; nothing of theirs needs an orderly end
     }
     rt_fatal("boot: unknown boot event %s (%s) from %s", what, detail ? detail : "", at);
@@ -309,6 +312,7 @@ void rt_frame_presented(const tex_t *t, uint64_t n) {
     vk_pipeline_save();   // no-op without the Vulkan back end
     prof_write();
     fflush(stderr);
+    input_vibration_shutdown();
     plat_exit(0);
 }
 

@@ -505,6 +505,7 @@ static void rebuild_if_needed(const char *dir) {
         return;
     }
     prof_write();   // plat_exit runs no atexit handlers
+    input_vibration_shutdown();
     plat_exit(0);
 }
 

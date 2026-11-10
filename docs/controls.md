@@ -1,6 +1,6 @@
 # Controls
 
-Input comes from the first SDL3 gamepad, the keyboard and the mouse, merged into one Switch controller (`runtime/input_win.c`). Buttons are ORed; each stick takes the source with the larger deflection. Keys and mouse buttons count only while the game window is in the foreground. `TOTK_INPUT=none` disables both (automated runs). `TOTK_*` settings can also be set in `totk.ini` next to `totk.exe` (`input = none`, `motion = 0`, `rumble = 0`); the environment overrides the file. `TOTK_RUMBLE_STRENGTH` is the rumble strength in percent (0 to 300, default 130; 0 is the same as `rumble = 0`). `TOTK_RUMBLE_CURVE` is the exponent applied to the amplitude before the strength (0.2 to 1.5, default 0.6; lower makes weak pulses stronger, 1 is linear). `TOTK_RUMBLE_TRIGGERS=1` also drives the impulse triggers of an Xbox pad.
+Input comes from the first SDL3 gamepad, the keyboard and the mouse, merged into one Switch controller (`runtime/input_win.c`). Buttons are ORed; each stick takes the source with the larger deflection. Keys and mouse buttons count only while the game window is in the foreground. `TOTK_INPUT=none` disables both (automated runs). `TOTK_*` settings can also be set in `totk.ini` next to `totk.exe` (`input = none`, `motion = 0`, `rumble = 0`); the environment overrides the file. `TOTK_RUMBLE_STRENGTH` is the rumble strength in percent (0 to 100, default 50; 100% requests 5x original amplitude, 20% is original; 0 is silent). `TOTK_RUMBLE_CURVE` is a deprecated compatibility key and no longer affects output. Both bands share saturation headroom to preserve their ratio; SDL applies no additional gain. `TOTK_RUMBLE_TRIGGERS=1` also drives the impulse triggers of an Xbox pad.
 
 `TOTK_PAD_LAYOUT` (`pad_layout`, the *Button layout* row on the Controls tab, live) picks which face button is Switch A:
 
@@ -203,7 +203,10 @@ On game 1.4.3, while one of the game's menus has its focus box (the frame the d-
 
 ## Nintendo Switch 2 controllers
 
-Windows does not present the Switch 2 Pro Controller as a gamepad SDL can open (the log says `input: no gamepad`), so it needs a bridge program that wakes it and creates a virtual gamepad. The DS4Windows fork by hbashton ([github.com/hbashton/DS4Windows](https://github.com/hbashton/DS4Windows), tested with release VIIPERRC4.5.1, a pre-release) with the output set to an emulated DualSense gives buttons, rumble, gyro and accelerometer, and reads the sticks through the controller's calibration (they rest at 0 to 2%). The game reads its virtual DualSense directly; the log then shows `input: gamepad "DualSense Wireless Controller" (rumble, gyro and accelerometer, ...)` and `input: motion sensors on`. Its release notes also list Joy-Con 2 support, which is untested here.
+With the workspace custom SDL3 and its matching libusb runtime, wired 057e:2069
+Switch 2 Pro is opened directly; no bridge is needed for this current build.
+Bluetooth is not implemented by that native driver. Earlier stock-SDL builds did
+not present the Switch 2 Pro Controller as a gamepad SDL could open (the log says `input: no gamepad`), so it needs a bridge program that wakes it and creates a virtual gamepad. The DS4Windows fork by hbashton ([github.com/hbashton/DS4Windows](https://github.com/hbashton/DS4Windows), tested with release VIIPERRC4.5.1, a pre-release) with the output set to an emulated DualSense gives buttons, rumble, gyro and accelerometer, and reads the sticks through the controller's calibration (they rest at 0 to 2%). The game reads its virtual DualSense directly; the log then shows `input: gamepad "DualSense Wireless Controller" (rumble, gyro and accelerometer, ...)` and `input: motion sensors on`. Its release notes also list Joy-Con 2 support, which is untested here.
 
 Bridges that output a ViGEm DualShock 4 (ProCon2Windows, connectyourpro as tested) give buttons and rumble but no motion: their virtual DualShock 4 reports a gyro and an accelerometer that never change, so motion aiming and Ultrahand rotation do nothing. Run one bridge at a time; Steam Input can also claim the controller, so close Steam if the bridge does not find it.
 
@@ -233,3 +236,16 @@ the game must be accepting camera input when the event reaches its camera update
 ## RenderDoc capture (blocked)
 
 `TOTK_RDOC=<frame>[,...]` (`runtime/rdoc_win.c`; `TOTK_RDOC_DIR`, `TOTK_RDOC_DLL`) loads RenderDoc before `vkCreateInstance`. RenderDoc hides `VK_EXT_external_memory_host`, which the back end requires for guest pool imports (`runtime/vk_memory.c`), so device creation fails under it. A capture needs a copy-based pool fallback first.
+
+
+## Asynchronous vibration output (2026-11-06)
+
+New values are published immediately to a dedicated owner. A four-millisecond
+USB service interval is not an application delay: curve timing remains the
+game's original timing. Stereo batches are atomic, strength is applied once,
+and raw vibration readback stays unscaled. Focus loss, permission disable,
+per-side 250 ms expiry and disconnect epochs invalidate old output. Normal exits
+stop/join the owner before closing the device. In a one-second synthetic 5 ms
+input test, 200 main-effect requests completed; host completion gaps alternated
+approximately 4/8 ms as expected for 5 ms input. This is not an actuator calibration
+or a gameplay/physical-unplug acceptance result.

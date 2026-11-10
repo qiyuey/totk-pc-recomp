@@ -81,11 +81,16 @@ int input_cursor_released(void);   // Esc or a non-client activation released th
 // Rumble: HD frequency/amplitude bands from the game to SDL3. Amplitudes are 0..1 and frequencies are Hz.
 // The fallback path reduces them to SDL's conventional low/high motors. 1 if a gamepad with rumble took it.
 int input_rumble(uint16_t low, uint16_t high, uint32_t ms);
-int input_rumble_hd(float left_low_amplitude, float left_low_frequency,
+// Rumble owner only: no game publisher takes the SDL device lock.
+uint32_t input_rumble_generation(void);
+int input_rumble_service(uint32_t *generation);
+void input_rumble_shutdown_device(void);
+void input_vibration_shutdown(void);
+int input_rumble_hd_epoch(float left_low_amplitude, float left_low_frequency,
                     float left_high_amplitude, float left_high_frequency,
                     float right_low_amplitude, float right_low_frequency,
                     float right_high_amplitude, float right_high_frequency,
-                    uint32_t ms);
+                    uint32_t ms, uint32_t generation);
 // Motor value for a normalised amplitude: pow(a, curve) * strength, saturated to 0..65535. Pure.
 uint16_t rumble_motor(float a, float curve, float strength);
 // TOTK_RUMBLE_TRIGGERS=1: input_rumble also drives the impulse triggers (Xbox) with the high motor's value.

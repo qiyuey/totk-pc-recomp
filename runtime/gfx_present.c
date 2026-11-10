@@ -23,6 +23,7 @@
 #include "gfx.h"
 #include "gfx_wsys.h"
 #include "nvn_api.h"
+#include "input.h"
 #include "platform/platform.h"
 #include "ui/menu.h"
 #include "vk.h"
@@ -70,6 +71,7 @@ void gfx_window_focus_changed(int in) {
 void gfx_window_closed(void) {
     int restart = plat_cas32(&g_restart, 0, 0) != 0;
     rt_log("gfx: window closed; %s", restart ? "restarting" : "exiting");
+    input_vibration_shutdown();
     fs_save_flush();
     vk_pipeline_save();
     prof_write();   // plat_exit runs no atexit handlers

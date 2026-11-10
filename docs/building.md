@@ -63,7 +63,20 @@ Missing custom headers or libraries stop the build instead of silently using sto
 
 Game vibration keeps the left/right low/high amplitudes and frequencies through `ov_input.c`, `input.c`, and
 `SDL_RumbleGamepadFrequenciesEx`. The custom SDL driver handles conventional pads. The runtime retains upstream
-controller discovery, polling, thread locking, rumble settings and optional trigger effects.
+controller discovery, polling, thread locking and optional trigger effects. Application strength is now 0..100%
+(default 50), with 100%=5x and shared per-side saturation. The old curve key is accepted but ignored;
+SDL receives the final normalized amplitudes without another gain.
+
+Scalar and stereo batch requests now publish to an event-driven owner; the guest
+thread does not wait on SDL. New output has no 4/10 ms software send gate. The
+owner preserves per-side 250 ms freshness, raw readback, focus/permission stops,
+connection generations, retries and normal-exit draining. The matching Windows
+libusb runtime is copied from the selected SDL package; override with
+`TOTK_SDL3_LIBUSB_DLL` if needed. Its unmodified LGPL licence is deployed beside
+it. Run `.venv/Scripts/python tests/vibration_check.py` for asset-free owner
+regressions. Explicit `--device` enables a synthetic low-amplitude 057e:2069 test;
+`--device-log build/vibration-device.log` retains its local transport trace.
+
 
 ## Build
 

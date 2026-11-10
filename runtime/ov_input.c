@@ -174,7 +174,6 @@ _Static_assert(sizeof(VibrationValue) == 16 && sizeof(VibrationDeviceInfo) == 8,
 enum { STYLE_INDEX_FULL_KEY = 3, STYLE_INDEX_HANDHELD = 4, SIX_AXIS_DEVICE = 2, RUMBLE_MS = 250 };
 #define RUMBLE_STALE_NS 250000000ull     // a side the game has not updated for 250 ms is silent
 #define RUMBLE_REFRESH_NS 50000000ull    // an unchanged value is sent again every 50 ms (its 250 ms start over)
-#define RUMBLE_MIN_GAP_NS 10000000ull    // a changed value at most every 10 ms (the game streams every few ms)
 static const VibrationValue vib_neutral = {0, 160, 0, 320};
 
 static int env_zero(const char *name) {
@@ -186,11 +185,9 @@ static void once(volatile int32_t *flag, const char *fmt, uint32_t v) {
     if (!plat_xchg32(flag, 1)) rt_log(fmt, v);
 }
 
-// TOTK_RUMBLE_STRENGTH (percent, 0..300, default 130; 0 = off) and TOTK_RUMBLE_CURVE (exponent on the amplitude, 0.2..1.5,
-// default 0.6). HD rumble is strong at low amplitude, an ERM motor hardly turns there, so weak values are lifted by the
-// curve (0.1 -> 0.25) and the strength scales the result (saturating at 65535; 0.66 and up reach full drive at 130 %).
-// Both are live settings (the menu): read again whenever cfg_version changes.
-static float rumble_strength = 1.3f, rumble_curve = 0.6f;
+// Strength is applied once before SDL: 0..100%, with 100%=5x for Switch content.
+// The legacy RUMBLE_CURVE key is accepted by config but no longer shapes output.
+static float rumble_strength = 2.5f;
 static volatile int32_t rumble_cfg_logged;
 static unsigned rumble_cfg_seen = ~0u;
 static float cfg_float(const char *name, float lo, float hi) {
@@ -201,11 +198,10 @@ static void rumble_cfg(void) {
     unsigned v = cfg_version();
     if (v == rumble_cfg_seen) return;
     rumble_cfg_seen = v;
-    rumble_strength = cfg_float("TOTK_RUMBLE_STRENGTH", 0, 300) / 100;
-    rumble_curve = cfg_float("TOTK_RUMBLE_CURVE", 0.2f, 1.5f);
+    rumble_strength = 5.0f * cfg_float("TOTK_RUMBLE_STRENGTH", 0, 100) / 100;
     int trig = input_rumble_triggers_enabled();
     if (!plat_xchg32(&rumble_cfg_logged, 1))
-        rt_log("hid: rumble strength %.0f%%, curve %.2f, triggers %s", rumble_strength * 100, rumble_curve, trig ? "on" : "off");
+        rt_log("hid: rumble strength %.0f%% (%.2fx), triggers %s", rumble_strength * 20, rumble_strength, trig ? "on" : "off");
 }
 
 static uint32_t pad_style_index(void) { return ov_handheld() ? STYLE_INDEX_HANDHELD : STYLE_INDEX_FULL_KEY; }
@@ -227,7 +223,6 @@ static void ov_vibration_handles(Cpu *c) {
     if (!out || max <= 0 || __builtin_popcount(style) != 1)
         rt_fatal("nn::hid::GetVibrationDeviceHandles: invalid arguments (count %d, styles %#x)", max, style);
     static volatile int32_t asked;
-    rumble_cfg();
     // strength 0 keeps the devices (silent), so the menu can turn rumble up again
     if (env_zero("TOTK_RUMBLE")) { once(&asked, "hid: no vibration devices (TOTK_RUMBLE=%u)", 0); ret_x(c, 0); return; }
     static const struct { uint8_t bit, n; uint32_t base; } t[] = {
@@ -288,49 +283,130 @@ static VibrationValue vib_last[2] = {{0, 160, 0, 320}, {0, 160, 0, 320}};   // v
 static uint64_t vib_at[2], sent_at;                                          // vib_lock
 static VibrationValue sent_vib[2];                                           // vib_lock
 static int sent_valid;                                                        // vib_lock
+static uint32_t vib_epoch[2], vib_device_epoch;
+static uint64_t vib_sequence, vib_stop_sequence, vib_retry_after;
+static int vib_stop, vib_closing;
+static PlatEvent vib_wake;
+static PlatOnce vib_once = PLAT_ONCE_INIT;
+static PlatThread *vib_thread;
+static volatile int32_t vib_thread_id, vib_shutdown_started;
 static int vib_allowed = 1;                                                  // vib_lock: PermitVibration
 
 static float clamp01(float v) { return v > 0 ? (v < 1 ? v : 1) : 0; }   // NaN -> 0
-// Switch HD rumble -> SDL_RumbleGamepadFrequenciesEx. Preserve both sides, amplitudes and frequencies end-to-end;
-// SDL's fallback handles pads that only expose conventional low/high motors. A side the game has not updated for 250 ms
-// is silent. Each send lasts 250 ms and is renewed every 50 ms while the game streams, so the pad stops by itself when
-// the game stops sending (pause, freeze). Under vib_lock.
+// The owner copies a complete raw stereo snapshot under vib_lock, then releases
+// it before controller I/O. New values wake it immediately; only failure, expiry
+// and constant-effect renewal use timers. Readback remains the game's raw value.
 static void rumble_update(uint64_t now) {
+    if (vib_retry_after && now < vib_retry_after) return;
     VibrationValue v[2] = {vib_neutral, vib_neutral};
     rumble_cfg();
-    for (int s = 0; s < 2 && vib_allowed; s++) {
-        if (!vib_at[s] || now - vib_at[s] > RUMBLE_STALE_NS) continue;
-        v[s] = vib_last[s];
+    for (int side = 0; side < 2 && vib_allowed && !vib_stop; ++side) {
+        int epoch_ok = vib_epoch[side] == vib_device_epoch || (!vib_epoch[side] && vib_device_epoch == 1);
+        if (vib_at[side] && now - vib_at[side] <= RUMBLE_STALE_NS && epoch_ok) v[side] = vib_last[side];
+        else vib_at[side] = 0;
     }
-    int changed = !sent_valid || memcmp(v, sent_vib, sizeof v) != 0;
+    int changed = !sent_valid || memcmp(v, sent_vib, sizeof v);
     int on = v[0].amp_low > 0 || v[0].amp_high > 0 || v[1].amp_low > 0 || v[1].amp_high > 0;
-    if (changed ? on && now - sent_at < RUMBLE_MIN_GAP_NS : !on || now - sent_at < RUMBLE_REFRESH_NS) return;
-    input_rumble_hd(clamp01(powf(clamp01(v[0].amp_low), rumble_curve) * rumble_strength), v[0].freq_low,
-                    clamp01(powf(clamp01(v[0].amp_high), rumble_curve) * rumble_strength), v[0].freq_high,
-                    clamp01(powf(clamp01(v[1].amp_low), rumble_curve) * rumble_strength), v[1].freq_low,
-                    clamp01(powf(clamp01(v[1].amp_high), rumble_curve) * rumble_strength), v[1].freq_high,
-                    on ? RUMBLE_MS : 0);
-    memcpy(sent_vib, v, sizeof v), sent_valid = 1, sent_at = now;
+    if (!vib_stop && !changed && (!on || now - sent_at < RUMBLE_REFRESH_NS)) return;
+    VibrationValue raw[2]; memcpy(raw, v, sizeof raw);
+    for (int side = 0; side < 2; ++side) {
+        float low = clamp01(v[side].amp_low), high = clamp01(v[side].amp_high);
+        float peak = fmaxf(low, high) * rumble_strength;
+        float scale = rumble_strength / fmaxf(1.0f, peak);
+        v[side].amp_low = low * scale; v[side].amp_high = high * scale;
+    }
+    uint64_t stop_sequence = vib_stop_sequence;
+    uint32_t generation = vib_device_epoch;
+    plat_mutex_unlock(&vib_lock);
+    int ok = input_rumble_hd_epoch(v[0].amp_low, v[0].freq_low, v[0].amp_high, v[0].freq_high,
+                                  v[1].amp_low, v[1].freq_low, v[1].amp_high, v[1].freq_high,
+                                  on ? RUMBLE_MS : 0, generation);
+    plat_mutex_lock(&vib_lock);
+    if (ok > 0) {
+        memcpy(sent_vib, raw, sizeof raw); sent_valid = 1; sent_at = now; vib_retry_after = 0;
+        if (!on && vib_stop_sequence == stop_sequence) {
+            vib_stop = 0;
+            plat_event_set(&vib_wake); // A newer activation may be held behind this stop.
+        }
+    } else {
+        vib_retry_after = kern_now_ns() + 4000000;
+        if (ok < 0) for (int side = 0; side < 2; ++side)
+            if (vib_epoch[side] == generation) vib_at[side] = 0;
+    }
 }
 
-static void play(int side, const VibrationValue *v) {
-    if (!v) rt_fatal("nn::hid::detail::SendVibrationValue: null value");
+static void rumble_main(void *unused) {
+    (void)unused;
+    plat_xchg32(&vib_thread_id, (int32_t)plat_thread_id());
+    for (;;) {
+        plat_mutex_lock(&vib_lock);
+        int closing = vib_closing;
+        plat_mutex_unlock(&vib_lock);
+        if (closing) { input_rumble_shutdown_device(); return; }
+        uint32_t generation;
+        int ready = input_rumble_service(&generation);
+        plat_mutex_lock(&vib_lock);
+        vib_device_epoch = generation;
+        if (!ready) {
+            uint32_t current = input_rumble_generation();
+            for (int side = 0; side < 2; ++side)
+                if (vib_epoch[side] != current || current == generation) vib_at[side] = 0;
+            sent_valid = 0;
+            vib_stop = 0; vib_retry_after = 0;
+        } else {
+            rumble_update(kern_now_ns());
+        }
+        int requested = vib_allowed && ((vib_at[0] && (vib_last[0].amp_low || vib_last[0].amp_high)) ||
+                                         (vib_at[1] && (vib_last[1].amp_low || vib_last[1].amp_high)));
+        int active = vib_stop || vib_retry_after || requested || (sent_valid && (sent_vib[0].amp_low || sent_vib[0].amp_high ||
+                                                sent_vib[1].amp_low || sent_vib[1].amp_high));
+        // Poll permission/focus and per-side expiry independently of game frames.
+        // This timeout never throttles publication: the auto-reset event wakes now.
+        plat_mutex_unlock(&vib_lock);
+        if (active) plat_event_wait_ns(&vib_wake, 4000000);
+        else plat_event_wait(&vib_wake);
+    }
+}
+
+void input_vibration_shutdown(void) {
+    if (!vib_thread || plat_thread_id() == (uint32_t)plat_cas32(&vib_thread_id, 0, 0)) return;
+    if (plat_xchg32(&vib_shutdown_started, 1)) return;
+    plat_mutex_lock(&vib_lock); vib_closing = 1; plat_mutex_unlock(&vib_lock);
+    plat_event_set(&vib_wake);
+    if (plat_thread_join_ns(vib_thread, 1000000000ull)) vib_thread = NULL;
+    else rt_log("input: rumble shutdown timed out; process exit will cancel pending I/O");
+}
+static void rumble_start(void *unused) {
+    (void)unused;
+    plat_event_init(&vib_wake, 0, 0);
+    vib_thread = plat_thread_new(rumble_main, NULL, "rumble");
+    if (!vib_thread) rt_fatal("input: cannot start the rumble thread");
+    atexit(input_vibration_shutdown);
+}
+static void play_locked(int side, const VibrationValue *value, uint32_t generation) {
+    if (!value) rt_fatal("nn::hid::detail::SendVibrationValue: null value");
+    if (side < 0 || vib_closing) return;
+    VibrationValue v = *value;
+    if (!isfinite(v.amp_low) || !isfinite(v.amp_high) || !isfinite(v.freq_low) || !isfinite(v.freq_high)) v = vib_neutral;
+    v.amp_low = clamp01(v.amp_low); v.amp_high = clamp01(v.amp_high);
+    vib_last[side] = v; vib_epoch[side] = generation;
+    vib_at[side] = vib_allowed ? kern_now_ns() : 0;
+    ++vib_sequence;
+}
+static void publish_locked(void) {
+    int on = vib_allowed && ((vib_at[0] && (vib_last[0].amp_low || vib_last[0].amp_high)) ||
+                              (vib_at[1] && (vib_last[1].amp_low || vib_last[1].amp_high)));
+    if (!on) {
+        if (!vib_stop) vib_retry_after = 0;
+        vib_stop = 1; ++vib_stop_sequence;
+    }
+}
+static void play(int side, const VibrationValue *value) {
     if (side < 0) return;
-    VibrationValue c = *v;
-    if (!isfinite(c.amp_low) || !isfinite(c.amp_high) || !isfinite(c.freq_low) || !isfinite(c.freq_high)) c = vib_neutral;
-    static volatile int32_t first, first_on;
-    if (!plat_xchg32(&first, 1))
-        rt_log("hid: first vibration value from the game: %s %.2f@%.0f Hz %.2f@%.0f Hz", side ? "right" : "left",
-               (double)c.amp_low, (double)c.freq_low, (double)c.amp_high, (double)c.freq_high);
-    if ((c.amp_low > 0.01f || c.amp_high > 0.01f) && !plat_xchg32(&first_on, 1))
-        rt_log("hid: first non-zero vibration from the game: %s %.2f@%.0f Hz %.2f@%.0f Hz", side ? "right" : "left",
-               (double)c.amp_low, (double)c.freq_low, (double)c.amp_high, (double)c.freq_high);
-    uint64_t now = kern_now_ns();
-    plat_mutex_lock(&vib_lock);
-    vib_last[side] = c;
-    vib_at[side] = now;
-    rumble_update(now);
-    plat_mutex_unlock(&vib_lock);
+    plat_once(&vib_once, rumble_start, NULL);
+    uint32_t generation = input_rumble_generation();
+    plat_mutex_lock(&vib_lock); play_locked(side, value, generation); publish_locked(); plat_mutex_unlock(&vib_lock);
+    plat_event_set(&vib_wake);
 }
 
 // Result detail::InitializeVibrationDevice(const VibrationDeviceHandle &)
@@ -354,7 +430,14 @@ static void ov_vib_send_many(Cpu *c) {
     const VibrationValue *v = arg_p(c, 1);
     int n = (int)arg_x(c, 2);
     if (n < 0 || (n && (!h || !v))) rt_fatal("nn::hid::detail::SendVibrationValues: invalid batch (%d values)", n);
-    for (int i = 0; i < n; i++) play(vibration_side(&h[i], "SendVibrationValues"), &v[i]);
+    if (!n) { ret_x(c, 0); return; }
+    plat_once(&vib_once, rumble_start, NULL);
+    uint32_t generation = input_rumble_generation();
+    plat_mutex_lock(&vib_lock);
+    for (int i = 0; i < n; ++i) play_locked(vibration_side(&h[i], "SendVibrationValues"), &v[i], generation);
+    publish_locked();
+    plat_mutex_unlock(&vib_lock);
+    plat_event_set(&vib_wake);
     ret_x(c, 0);
 }
 
@@ -401,10 +484,16 @@ static void ov_vib_permitted(Cpu *c) {
 // Result detail::PermitVibration(bool): off silences the gamepad at once
 static void ov_vib_permit(Cpu *c) {
     int on = (arg_x(c, 0) & 0xff) != 0;
+    plat_once(&vib_once, rumble_start, NULL);
     plat_mutex_lock(&vib_lock);
     vib_allowed = on;
-    rumble_update(kern_now_ns());
+    if (!on) {
+        vib_at[0] = vib_at[1] = 0;
+        if (!vib_stop) vib_retry_after = 0;
+        vib_stop = 1; ++vib_stop_sequence;
+    }
     plat_mutex_unlock(&vib_lock);
+    plat_event_set(&vib_wake);
     ret_x(c, 0);
 }
 
