@@ -8,7 +8,7 @@ The same model as the Windows release (tools/make_release.py, whose download cac
 folder carries the setup and a toolchain, never game code; the player's machine builds the game. Everything that runs on
 the player's machine is built against the Steam Runtime 3 "sniper" SDK sysroot (glibc 2.31), so the AppImage and the
 game it builds run on SteamOS and on any distribution at least as new. Needs network access on the first run, make,
-the .NET 10 SDK and Python 3.12+ with Pillow (.venv). The folder holds:
+the .NET 11 SDK and Python 3.12+ with Pillow (.venv). The folder holds:
 
     python/    python-build-standalone 3.14 (with tkinter) + the packages of tools/requirements-installer.txt; a .pth
                file puts the folder, tools/ and recomp/ on sys.path

@@ -139,7 +139,7 @@ int probe_cfg(void) {
     CHECK(m && EQ(m->key, "VK_PRESENT") && EQ(m->values, "mailbox|fifo|immediate") && m->live,
           "meta: prefix and case are accepted");
     m = cfg_meta("RUMBLE_STRENGTH");
-    CHECK(m && EQ(m->def, "50") && EQ(m->values, "0..100"), "meta: rumble strength 50 in 0..100");
+    CHECK(m && EQ(m->def, "100") && EQ(m->values, "0..100"), "meta: rumble strength defaults to 100");
     m = cfg_meta("PERF_OVERLAY");
     CHECK(m && EQ(m->def, "off") && EQ(m->values, "off|fps|full") && m->live, "meta: perf_overlay is live, off by default");
     CHECK(cfg_meta("BIND_A") == NULL && cfg_meta("FPS_COUNTER") == NULL && cfg_meta("NO_SUCH") == NULL,

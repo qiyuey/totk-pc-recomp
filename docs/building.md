@@ -16,7 +16,7 @@ Versions are the ones the build was verified with; newer patch releases are fine
 |---|---|---|---|
 | MSYS2 UCRT64 | clang/lld 23.1.3 | msys2.org installer to `C:\msys64`, packages below | compiling the generated C and the runtime |
 | Visual Studio Build Tools | 2026, C++ workload, Windows SDK 10.0.26100 | winget `Microsoft.VisualStudio.BuildTools` with `--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended` | the linker .NET NativeAOT calls |
-| .NET SDK | 10.0 | winget `Microsoft.DotNet.SDK.10` | the shader translator (`totk_xlate.exe`) |
+| .NET SDK | 11.0.100 | winget `Microsoft.DotNet.SDK.11` | the shader translator (`totk_xlate.exe`) |
 | Vulkan SDK | 1.4.363 | winget `KhronosGroup.VulkanSDK` | validation layers, `vulkaninfo` |
 | uv | 0.13 | standalone installer from astral.sh | the Python environment |
 | hactool | 1.4.0 @ `1d64a83` | `.venv\Scripts\python tools\build_hactool.py`, see below | NCA and update extraction |
@@ -63,9 +63,9 @@ Missing custom headers or libraries stop the build instead of silently using sto
 
 Game vibration keeps the left/right low/high amplitudes and frequencies through `ov_input.c`, `input.c`, and
 `SDL_RumbleGamepadFrequenciesEx`. The custom SDL driver handles conventional pads. The runtime retains upstream
-controller discovery, polling, thread locking and optional trigger effects. Application strength is now 0..100%
-(default 50), with 100%=5x and shared per-side saturation. The old curve key is accepted but ignored;
-SDL receives the final normalized amplitudes without another gain.
+controller discovery, polling, thread locking and optional trigger effects. Application strength defaults to 100%,
+which requests 5x amplitude before shared per-side saturation. Set `rumble_strength` in `totk.ini` to override it.
+The legacy curve key has no effect. SDL receives the final normalized amplitudes without another gain.
 
 Scalar and stereo batch requests now publish to an event-driven owner; the guest
 thread does not wait on SDL. New output has no 4/10 ms software send gate. The
@@ -119,6 +119,13 @@ of them.
    .venv\Scripts\python tools\build_game.py --version <ver>
    ```
 
+   Local Windows MSYS2 builds use `-O2 -flto=thin` for the runtime and generated game code, with ThinLTO at link time.
+   Pass `--cpu znver4` to build for an AMD Zen 4 machine, as in the local Savage Wind build. The default remains
+   x86-64-v3. The x86-64-v2 and prebuilt-runtime build paths use native objects.
+
+   Place a personal Windows icon at `game/totk-local.ico` to embed it in locally built executables. The ignored
+   `game/` folder keeps the icon available across clean builds.
+
    `--cpu v2` targets x86-64-v2 (SSE4.2, no AVX2/FMA) for older CPUs; the default `v3` needs AVX2. The v2 build links
    `runtime/fma.c`, a correctly rounded software fma the FP lowering needs, and runs slower. Inline assembly,
    target attributes and intrinsics are not bound by `-march`, so a v2 build runs `tools/check_isa.py` over the runtime
@@ -127,7 +134,7 @@ of them.
 
    `gen.py` sizes its emit pool from the CPU count and the free memory; `--jobs N` sets it, and so does the environment variable `TOTK_LIFT_JOBS=N`, which the installer's lift step honours too (it has no `--jobs`). When a worker runs out of memory, the pool restarts with half the workers (`emit: out of memory with N workers, retrying with M`), down to one; only an out-of-memory error with one worker fails the step.
 
-   Lifting takes about 15 s, a clean compile about 200 s on 24 threads; later builds recompile only what changed.
+   Lifting takes about 15 s. Clean builds compile all generated chunks, and later builds recompile only what changed.
    A compiler cache in front of clang shortens it further: with `SCCACHE` set to an sccache executable, `build_game.py`
    writes it into the ninja file ahead of `cc`, and every lift rewrites the generated chunks with the same contents, so
    a second build of the same version hits all of their objects:

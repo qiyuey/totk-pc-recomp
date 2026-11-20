@@ -34,7 +34,7 @@ enum { PAD_USED = 16384, MOUSE_USED = 6 };
 static volatile int32_t g_kbm_last = 1;
 int input_kbm_last(void) { return __atomic_load_n(&g_kbm_last, __ATOMIC_RELAXED); }
 static SDL_Gamepad *pad;
-static uint64_t next_scan;
+static uint64_t next_scan_ms;
 static volatile int32_t rumble_epoch;
 static volatile int32_t rumble_foreground = -1;
 static int rumble_ready_state = -1;
@@ -435,6 +435,17 @@ static void scan_pads(void) {
            motion ? "gyro and accelerometer" : "no motion sensors", pad_east_a ? "labelled A" : "not labelled A");
 }
 
+// Under lock, state 1. Input and rumble share one retry deadline while the pad is absent.
+static void poll_pads(void) {
+    SDL_UpdateGamepads();
+    if (pad && SDL_GamepadConnected(pad)) return;
+    uint64_t now_ms = plat_now_ns() / 1000000u;
+    if (pad || now_ms >= next_scan_ms) {
+        scan_pads();
+        next_scan_ms = now_ms + RESCAN_MS;
+    }
+}
+
 // Under lock: the layout of the open gamepad, picked again when a setting or the gamepad changed; logs each change.
 static int pad_layout_get(void) {
     unsigned ver = cfg_version();
@@ -578,9 +589,8 @@ static int32_t map_zoom_stick(int32_t notches, int on_map) {
 
 // Under lock, state 1: the open gamepad's inputs by position (pd[PAD_*] != 0 held); 0 without a connected gamepad.
 static int pad_physical(uint8_t pd[PAD_COUNT]) {
-    if ((!pad || !SDL_GamepadConnected(pad)) && plat_now_ns() / 1000000u >= next_scan) { next_scan = plat_now_ns() / 1000000u + RESCAN_MS; scan_pads(); }
-    SDL_UpdateGamepads();
-    if (!pad || !SDL_GamepadConnected(pad)) return 0;
+    poll_pads();
+    if (!pad) return 0;
     for (int p = PAD_SOUTH; p < PAD_ZL; p++) pd[p] = SDL_GetGamepadButton(pad, pad_sdl[p]);
     pd[PAD_ZL] = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > TRIGGER_ON;
     pd[PAD_ZR] = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > TRIGGER_ON;
@@ -854,14 +864,7 @@ uint32_t input_rumble_generation(void) {
 int input_rumble_service(uint32_t *generation) {
     plat_mutex_lock(&lock);
     if (!state) start();
-    if (state == 1) {
-        SDL_UpdateGamepads();
-        uint64_t now = kern_now_ns();
-        if (pad || now >= next_scan) {
-            scan_pads();
-            next_scan = now + (uint64_t)RESCAN_MS * 1000000;
-        }
-    }
+    if (state == 1) poll_pads();
     *generation = input_rumble_generation();
     int ready = state == 1 && pad && pad_rumble && plat_cas32(&rumble_foreground, 0, 0);
     if (!ready && rumble_ready_state == 1 && pad)
@@ -906,6 +909,7 @@ int input_rumble_hd_epoch(float left_low_amplitude, float left_low_frequency,
             float trigger_a = right_high_amplitude > left_high_amplitude ? right_high_amplitude : left_high_amplitude;
             SDL_RumbleGamepadTriggers(pad, rumble_motor(trigger_a, 1, 1), rumble_motor(trigger_a, 1, 1), ms);
         }
+        if (ok) SDL_UpdateGamepads();
     }
     plat_mutex_unlock(&lock);
     return ok;

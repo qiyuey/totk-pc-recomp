@@ -230,8 +230,6 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_CHANNELS_AUTO] = "Automatic", [UI_MENU_CHANNELS_STEREO] = "Stereo", [UI_MENU_CHANNELS_51] = "5.1 surround",
 
     [UI_MENU_MOTION] = "Motion controls", [UI_MENU_MOTION_DESC] = "Aiming with the controller's gyroscope.",
-    [UI_MENU_RUMBLE_STRENGTH] = "Vibration strength",
-    [UI_MENU_RUMBLE_STRENGTH_DESC] = "How strong the controller vibrates.",
     [UI_MENU_RUMBLE_CURVE] = "Vibration curve",
     [UI_MENU_RUMBLE_CURVE_DESC] = "Lower values make weak vibration stronger.",
     [UI_MENU_RUMBLE_TRIGGERS] = "Trigger vibration (Xbox)",
@@ -452,9 +450,6 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_RESET_CONFIRM] = "Reset every setting to its default?", [UI_MENU_RESET_YES] = "Reset",
     [UI_MENU_RESET_NO] = "Cancel",
 
-    [UI_MENU_OV_BUILD_SHADER] = "Compiling shaders: %d",
-    [UI_MENU_OV_BUILD_PIPE] = "Building pipelines: %d",
-    [UI_MENU_OV_BUILD_RECENT] = "Recent graphics preparation",
     [UI_MENU_OV_FPS] = "%.0f FPS", [UI_MENU_OV_FRAME_MS] = "%.1f ms", [UI_MENU_OV_GAME_PCT] = "game %.0f%%",
     [UI_MENU_OV_MAX_MS] = "max %.1f ms",
     [UI_MENU_OV_FPS_LABEL] = "FPS", [UI_MENU_OV_FRAME_LABEL] = "Frame", [UI_MENU_OV_FMT_FPS] = "%.0f",
@@ -701,8 +696,6 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_CHANNELS_AUTO] = "Автоматически", [UI_MENU_CHANNELS_STEREO] = "Стерео", [UI_MENU_CHANNELS_51] = "Объёмный 5.1",
 
     [UI_MENU_MOTION] = "Управление движением", [UI_MENU_MOTION_DESC] = "Прицеливание гироскопом контроллера.",
-    [UI_MENU_RUMBLE_STRENGTH] = "Сила вибрации",
-    [UI_MENU_RUMBLE_STRENGTH_DESC] = "Насколько сильно вибрирует контроллер.",
     [UI_MENU_RUMBLE_CURVE] = "Кривая вибрации",
     [UI_MENU_RUMBLE_CURVE_DESC] = "Чем ниже значение, тем сильнее слабая вибрация.",
     [UI_MENU_RUMBLE_TRIGGERS] = "Вибрация триггеров (Xbox)",
@@ -1093,8 +1086,6 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
     [UI_MENU_VOLUME] = "Volume", [UI_MENU_VOLUME_DESC] = "Volume geral do jogo.",
 
     [UI_MENU_MOTION] = "Controles de movimento", [UI_MENU_MOTION_DESC] = "Mirar com o giroscópio do controle.",
-    [UI_MENU_RUMBLE_STRENGTH] = "Intensidade da vibração",
-    [UI_MENU_RUMBLE_STRENGTH_DESC] = "Quão forte o controle vibra.",
     [UI_MENU_RUMBLE_CURVE] = "Curva da vibração",
     [UI_MENU_RUMBLE_CURVE_DESC] = "Valores menores deixam a vibração fraca mais forte.",
     [UI_MENU_RUMBLE_TRIGGERS] = "Vibração dos gatilhos (Xbox)",
@@ -1484,9 +1475,6 @@ static const char *const text_pt_br[UI_TEXT_COUNT] = {
 // when the menu language is zh-Hans (ui_text.h menu_text). The rows are fixed width, so the strings stay close to the
 // English length; an id without a Chinese entry falls back to English.
 static const char *const text_zh_hans[UI_TEXT_COUNT] = {
-    [UI_MENU_OV_BUILD_SHADER] = "正在编译着色器：%d",
-    [UI_MENU_OV_BUILD_PIPE] = "正在构建图形管线：%d",
-    [UI_MENU_OV_BUILD_RECENT] = "刚刚进行了图形准备",
     SWKBD("文字输入", "请输入名字", "马儿", "确定", "取消", "手柄：A 确定，B 取消"),
 
     [UI_MENU_TITLE] = "设置",
@@ -1639,8 +1627,6 @@ static const char *const text_zh_hans[UI_TEXT_COUNT] = {
     [UI_MENU_VOLUME_DESC] = "游戏的主音量。",
     [UI_MENU_MOTION] = "体感操作",
     [UI_MENU_MOTION_DESC] = "用手柄的陀螺仪瞄准。",
-    [UI_MENU_RUMBLE_STRENGTH] = "振动强度",
-    [UI_MENU_RUMBLE_STRENGTH_DESC] = "手柄振动的强弱。",
     [UI_MENU_RUMBLE_CURVE] = "振动曲线",
     [UI_MENU_RUMBLE_CURVE_DESC] = "数值越低，弱振动越强。",
     [UI_MENU_RUMBLE_TRIGGERS] = "扳机振动（Xbox）",

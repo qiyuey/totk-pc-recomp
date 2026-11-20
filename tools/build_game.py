@@ -151,13 +151,20 @@ GEN_FLAGS = ['-O1', '-fno-strict-aliasing', '-Wno-return-type', '-Wno-unused-lab
 RT_FLAGS = ['-O2', '-g', '-Wall', '-fno-strict-aliasing', '-march=x86-64-v3']
 
 
-def set_cpu(cpu):
-    """Target x86-64-v3 (the default) or x86-64-v2. RT_CPU_LEVEL lets runtime/main.c's self-test check the same
-    instruction set the build was compiled for."""
-    march = f'-march=x86-64-{cpu}'
-    GEN_FLAGS[GEN_FLAGS.index('-march=x86-64-v3')] = march
-    RT_FLAGS[RT_FLAGS.index('-march=x86-64-v3')] = march
-    RT_FLAGS.append(f'-DRT_CPU_LEVEL={3 if cpu == "v3" else 2}')
+def configure_optimization(args):
+    cpu = args.cpu
+    arch = 'znver4' if cpu == 'znver4' else f'x86-64-{cpu}'
+    march = f'-march={arch}'
+    for flags in (GEN_FLAGS, RT_FLAGS):
+        flags[flags.index('-march=x86-64-v3')] = march
+    RT_FLAGS.append(f'-DRT_CPU_LEVEL={2 if cpu == "v2" else 3}')
+
+    # The v2 build disassembles native objects before linking. Release builds use prebuilt runtime archives.
+    if WIN and cpu != 'v2' and not (args.toolchain or args.make_runtime_lib or args.runtime_lib):
+        GEN_FLAGS[0] = '-O2'
+        GEN_FLAGS.append('-flto=thin')
+        RT_FLAGS.append('-flto=thin')
+        LINK_FLAGS.extend(['-O2', march, '-flto=thin'])
 
 
 # Profile-guided optimisation (--pgo). Both modes compile the generated code at -O2, the level the profile's inlining and
@@ -172,7 +179,7 @@ def set_pgo(pgo, out):
     out/pgo/default_<id>.profraw every minute and at exit (runtime/platform win32.c), across runs. --pgo FILE: compile
     with that merged profile (tools/pgo.py merge). Functions the profile never saw run are optimised for size."""
     global PGO_INPUT
-    GEN_FLAGS[GEN_FLAGS.index('-O1')] = '-O2'
+    GEN_FLAGS[0] = '-O2'
     if pgo == 'gen':
         # absolute: the instrumented exe resolves the directory against its own working directory
         flags = [f'-fprofile-generate={cmd_arg((out / "pgo").resolve().as_posix())}']
@@ -193,7 +200,8 @@ if WIN:
     # to Windows 7, which hides the per-monitor DPI functions gfx_window_win.c and dpi_probe_win.c call.
     RT_FLAGS.append('-D_WIN32_WINNT=0x0A00')
     # -Xlinker passes the map path as one argument; -Wl, would split it at any comma in the build dir path
-    LINK_FLAGS = ['-fuse-ld=lld', '-Wl,--stack,16777216', '-Xlinker', '"--Map=$builddir/totk.map"']   # the map feeds tools/prof_report.py
+    LINK_FLAGS = ['-fuse-ld=lld', '-mwindows', '-Wl,--stack,16777216',
+                  '-Xlinker', '"--Map=$builddir/totk.map"']   # the map feeds tools/prof_report.py
     LINK_LIBS = ['-lpsapi', '-lbcrypt', '-lvulkan-1', '-luser32', '-lgdi32', '-ldwmapi', '-limm32', '-lwinmm', '-lole32', '-lshell32', '-luuid', '-lSDL3', '-lopus', '-l:libvpx.a', '-l:libzstd.a', '-l:libstdc++.a', '-l:libwinpthread.a']   # Vulkan back end; libvpx static (movies); libzstd static (resolution.c)
     VMA_INCLUDE = UCRT.parent / 'include' / 'vma'   # vk_mem_alloc.h; MSYS2 package vulkan-memory-allocator
 else:
@@ -483,9 +491,17 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
         sources += [out / 'modules.c']
     for src in sources:
         o = runtime_object(out, src)
-        if src.suffix == '.rc':   # windres writes no depfile: the files totk.rc embeds are listed by hand
+        if src.suffix == '.rc':   # windres writes no depfile: list the embedded assets explicitly
+            icon = RUNTIME / 'totk.ico'
+            local_icon = ROOT / 'game' / 'totk-local.ico'
+            if WIN and not (make_lib or runtime_lib or TOOLCHAIN_BIN) and local_icon.is_file():
+                icon = local_icon
+                local_rc = out / 'totk-local.rc'
+                resource = src.read_text(encoding='utf-8').replace('"totk.ico"', f'"{icon.as_posix()}"')
+                write_if_changed(local_rc, resource)
+                src = local_rc
             lines.append(f'build {ninja_path(o)}: rc {ninja_path(src)} | {ninja_path(RUNTIME / "totk.manifest")} '
-                         f'{ninja_path(RUNTIME / "totk.ico")}')
+                         f'{ninja_path(icon)}')
         else:
             lines.append(f'build {ninja_path(o)}: cc_rt {ninja_path(src)}{pgo_dep}')
         rt.append(o)
@@ -814,8 +830,8 @@ def mib(n):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('--version', default='v121', help='game version (default v121)')
-    ap.add_argument('--cpu', choices=('v2', 'v3'), default='v3',
-                    help='target CPU level: v3 (AVX2/FMA, default) or v2 (SSE4.2, for older CPUs; slower)')
+    ap.add_argument('--cpu', choices=('v2', 'v3', 'znver4') if WIN else ('v2', 'v3'), default='v3',
+                    help='target CPU: v3 (AVX2/FMA, default), v2 (SSE4.2), or znver4 (Windows, AMD Zen 4)')
     ap.add_argument('--gen', type=Path, help='generated C directory (default generated/<version>)')
     ap.add_argument('--out', type=Path, help='build directory (default build/<version>)')
     ap.add_argument('--modules', help='comma-separated subset of the layout modules (default all)')
@@ -857,7 +873,7 @@ def main():
     ap.add_argument('--expected', type=Path,
                     help='expected hashes (default tools/data/expected-<display version>.json)')
     args = ap.parse_args()
-    set_cpu(args.cpu)
+    configure_optimization(args)
 
     gen = (args.gen or ROOT / 'generated' / args.version).resolve()
     out = (args.out or ROOT / 'build' / args.version).resolve()

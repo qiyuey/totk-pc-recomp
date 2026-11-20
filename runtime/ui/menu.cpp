@@ -839,7 +839,6 @@ static void tab_controls(float scale) {
     opt_choice("TOTK_PROMPTS", UI_MENU_PROMPTS, prompts, 3, UI_MENU_PROMPTS_DESC, note);
     bool ask = restart && opt_button("##restart", UI_MENU_RESTART, UI_MENU_RESTART_DESC);
     opt_toggle("TOTK_MOTION", UI_MENU_MOTION, UI_MENU_MOTION_DESC);
-    opt_slider("TOTK_RUMBLE_STRENGTH", UI_MENU_RUMBLE_STRENGTH, 0, 100, UI_MENU_RUMBLE_STRENGTH_DESC, 10, "%.0f %%");
     opt_toggle("TOTK_RUMBLE_TRIGGERS", UI_MENU_RUMBLE_TRIGGERS, UI_MENU_RUMBLE_TRIGGERS_DESC);
     static const UiTextId mouse_modes[] = {UI_MENU_MOUSE_STICK, UI_MENU_MOUSE_DIRECT};
     opt_choice("TOTK_MOUSE_MODE", UI_MENU_MOUSE_MODE, mouse_modes, 2, UI_MENU_MOUSE_MODE_DESC);
@@ -1382,26 +1381,6 @@ static void perf_picture(const MenuTarget *t, const ImVec4 &c) {
     ImGui::EndTable();
 }
 
-// Keep even a sub-frame build visible, without treating ordinary frame-time spikes as compilation.
-static void perf_build_text(const PerfStats &s, char *out, size_t size) {
-    static uint64_t finished[2], last_activity;
-    uint64_t now = plat_now_ns();
-    bool active = s.build_active[0] || s.build_active[1];
-    if (active || s.build_finished[0] != finished[0] || s.build_finished[1] != finished[1])
-        last_activity = now;
-    finished[0] = s.build_finished[0];
-    finished[1] = s.build_finished[1];
-    out[0] = 0;
-    if (active) {
-        char shader[128] = {}, pipe[128] = {};
-        if (s.build_active[0]) snprintf(shader, sizeof shader, menu_text(UI_MENU_OV_BUILD_SHADER), s.build_active[0]);
-        if (s.build_active[1]) snprintf(pipe, sizeof pipe, menu_text(UI_MENU_OV_BUILD_PIPE), s.build_active[1]);
-        snprintf(out, size, "%s%s%s", shader, shader[0] && pipe[0] ? " | " : "", pipe);
-    } else if (last_activity && now - last_activity < 2000000000ull) {
-        snprintf(out, size, "%s", menu_text(UI_MENU_OV_BUILD_RECENT));
-    }
-}
-
 static void perf_full_draw(const MenuTarget *t, float scale) {
     float w = (float)t->width;
     PerfStats s;
@@ -1493,9 +1472,6 @@ static void perf_full_draw(const MenuTarget *t, float scale) {
         perf_cell(UI_MENU_OV_PER_FRAME, s.tex_uploads);
         ImGui::EndTable();
     }
-    char build_text[320];
-    perf_build_text(s, build_text, sizeof build_text);
-    if (build_text[0]) ImGui::TextColored(wait_c, "%s", build_text);
     perf_picture(t, pic_c);
     if (s.gpu_name[0]) ImGui::TextDisabled("%s", s.gpu_name);
     if (s.cpu_name[0]) ImGui::TextDisabled("%s", s.cpu_name);
@@ -1508,16 +1484,11 @@ static void perf_draw(const MenuTarget *t, float scale) {
     if (!g_perf_mode || !g_perf_text[0]) return;
     // with the menu open: under its window, over the dimming layout_menu drew before
     ImDrawList *dl = g_open.load(std::memory_order_relaxed) ? ImGui::GetBackgroundDrawList() : ImGui::GetForegroundDrawList();
-    PerfStats s;
-    perfmon_snapshot(&s);
-    char build_text[320], text[512];
-    perf_build_text(s, build_text, sizeof build_text);
-    snprintf(text, sizeof text, "%s%s%s", g_perf_text, build_text[0] ? "\n" : "", build_text);
-    ImVec2 sz = ImGui::CalcTextSize(text);
+    ImVec2 sz = ImGui::CalcTextSize(g_perf_text);
     float pad = 6 * scale;
     ImVec2 p(w - 12 * scale - sz.x - pad * 2, 12 * scale);   // the top right corner: the game's HUD leaves it empty
     dl->AddRectFilled(p, ImVec2(p.x + sz.x + pad * 2, p.y + sz.y + pad * 2), IM_COL32(0, 0, 0, 150), 4 * scale);
-    dl->AddText(ImVec2(p.x + pad, p.y + pad), IM_COL32(255, 255, 255, 235), text);
+    dl->AddText(ImVec2(p.x + pad, p.y + pad), IM_COL32(255, 255, 255, 235), g_perf_text);
 }
 
 extern "C" int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const char **shot) {

@@ -171,9 +171,9 @@ typedef struct { float amp_low, freq_low, amp_high, freq_high; } VibrationValue;
 typedef struct { uint32_t type, position; } VibrationDeviceInfo;   // type 1 linear resonant actuator; position 1 left, 2 right
 _Static_assert(sizeof(VibrationValue) == 16 && sizeof(VibrationDeviceInfo) == 8, "vibration ABI");
 
-enum { STYLE_INDEX_FULL_KEY = 3, STYLE_INDEX_HANDHELD = 4, SIX_AXIS_DEVICE = 2, RUMBLE_MS = 250 };
+enum { STYLE_INDEX_FULL_KEY = 3, STYLE_INDEX_HANDHELD = 4, SIX_AXIS_DEVICE = 2, RUMBLE_MS = 100 };
 #define RUMBLE_STALE_NS 250000000ull     // a side the game has not updated for 250 ms is silent
-#define RUMBLE_REFRESH_NS 50000000ull    // an unchanged value is sent again every 50 ms (its 250 ms start over)
+#define RUMBLE_REFRESH_NS 50000000ull    // refresh an unchanged active output before its 100 ms lease ends
 static const VibrationValue vib_neutral = {0, 160, 0, 320};
 
 static int env_zero(const char *name) {
@@ -187,7 +187,7 @@ static void once(volatile int32_t *flag, const char *fmt, uint32_t v) {
 
 // Strength is applied once before SDL: 0..100%, with 100%=5x for Switch content.
 // The legacy RUMBLE_CURVE key is accepted by config but no longer shapes output.
-static float rumble_strength = 2.5f;
+static float rumble_strength = 5.0f;
 static volatile int32_t rumble_cfg_logged;
 static unsigned rumble_cfg_seen = ~0u;
 static float cfg_float(const char *name, float lo, float hi) {
@@ -305,15 +305,24 @@ static void rumble_update(uint64_t now) {
         if (vib_at[side] && now - vib_at[side] <= RUMBLE_STALE_NS && epoch_ok) v[side] = vib_last[side];
         else vib_at[side] = 0;
     }
-    int changed = !sent_valid || memcmp(v, sent_vib, sizeof v);
-    int on = v[0].amp_low > 0 || v[0].amp_high > 0 || v[1].amp_low > 0 || v[1].amp_high > 0;
-    if (!vib_stop && !changed && (!on || now - sent_at < RUMBLE_REFRESH_NS)) return;
-    VibrationValue raw[2]; memcpy(raw, v, sizeof raw);
+    int on = 0;
     for (int side = 0; side < 2; ++side) {
         float low = clamp01(v[side].amp_low), high = clamp01(v[side].amp_high);
         float peak = fmaxf(low, high) * rumble_strength;
         float scale = rumble_strength / fmaxf(1.0f, peak);
         v[side].amp_low = low * scale; v[side].amp_high = high * scale;
+        if (v[side].amp_low || v[side].amp_high) on = 1;
+        else v[side] = vib_neutral;   // silent bands need no frequency changes on the wire
+    }
+    // Compare what reaches the controller. A neutral value already accepted by
+    // SDL satisfies repeated stops, preserving time for Bluetooth input reads.
+    int changed = !sent_valid || memcmp(v, sent_vib, sizeof v);
+    if (!vib_retry_after && !changed && (!on || now - sent_at < RUMBLE_REFRESH_NS)) {
+        if (vib_stop) {
+            vib_stop = 0;
+            plat_event_set(&vib_wake);   // a newer activation may be held behind this stop
+        }
+        return;
     }
     uint64_t stop_sequence = vib_stop_sequence;
     uint32_t generation = vib_device_epoch;
@@ -323,7 +332,7 @@ static void rumble_update(uint64_t now) {
                                   on ? RUMBLE_MS : 0, generation);
     plat_mutex_lock(&vib_lock);
     if (ok > 0) {
-        memcpy(sent_vib, raw, sizeof raw); sent_valid = 1; sent_at = now; vib_retry_after = 0;
+        memcpy(sent_vib, v, sizeof v); sent_valid = 1; sent_at = now; vib_retry_after = 0;
         if (!on && vib_stop_sequence == stop_sequence) {
             vib_stop = 0;
             plat_event_set(&vib_wake); // A newer activation may be held behind this stop.
@@ -346,6 +355,7 @@ static void rumble_main(void *unused) {
         uint32_t generation;
         int ready = input_rumble_service(&generation);
         plat_mutex_lock(&vib_lock);
+        if (vib_device_epoch != generation) sent_valid = 0;
         vib_device_epoch = generation;
         if (!ready) {
             uint32_t current = input_rumble_generation();
