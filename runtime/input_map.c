@@ -16,7 +16,7 @@
 #define DEFAULT_KEYS \
     {KEY_W, B_SL_UP}, {KEY_A, B_SL_LEFT}, {KEY_S, B_SL_DOWN}, {KEY_D, B_SL_RIGHT},                  /* move */ \
     {KEY_UP, B_SR_UP}, {KEY_LEFT, B_SR_LEFT}, {KEY_DOWN, B_SR_DOWN}, {KEY_RIGHT, B_SR_RIGHT},       /* camera, second source */ \
-    {KEY_MOUSE_L, B_Y}, {KEY_MOUSE_R, B_ZL}, {KEY_Z, B_ZL}, {KEY_F, B_ZR}, {KEY_X, B_ZR}, \
+    {KEY_MOUSE_L, B_Y}, {KEY_T, B_Y}, {KEY_MOUSE_R, B_ZL}, {KEY_Z, B_ZL}, {KEY_F, B_ZR}, {KEY_X, B_ZR}, \
     {KEY_SPACE, B_X}, {KEY_LSHIFT, B_B}, {KEY_E, B_A}, {KEY_Q, B_L}, {KEY_R, B_R}, \
     {KEY_LCTRL, B_STICK_L}, {KEY_C, B_STICK_R}, \
     {KEY_1, B_LEFT}, {KEY_2, B_UP}, {KEY_3, B_RIGHT}, {KEY_4, B_DOWN}, \
@@ -31,7 +31,7 @@
     {PAD_ZR, B_ZR}
 #define NINTENDO_PADS DEFAULT_PADS(B_B, B_A, B_Y, B_X)
 #define XBOX_PADS DEFAULT_PADS(B_A, B_B, B_X, B_Y)
-enum { DEFAULT_KEY_COUNT = 27, DEFAULT_PAD_COUNT = 16 };
+enum { DEFAULT_KEY_COUNT = 28, DEFAULT_PAD_COUNT = 16 };
 _Static_assert(sizeof (Binding[]){DEFAULT_KEYS} / sizeof (Binding) == DEFAULT_KEY_COUNT, "DEFAULT_KEY_COUNT");
 
 static const InputMap defaults = {{DEFAULT_KEYS}, DEFAULT_KEY_COUNT, {{NINTENDO_PADS}, {XBOX_PADS}},
@@ -44,7 +44,8 @@ static const char *const action_names[ACTION_COUNT] = {
     "LSTICK_LEFT", "LSTICK_UP", "LSTICK_RIGHT", "LSTICK_DOWN", "RSTICK_LEFT", "RSTICK_UP", "RSTICK_RIGHT", "RSTICK_DOWN", "SHAKE"};
 static const char *const pad_names[PAD_COUNT] = {
     NULL, "south", "east", "west", "north", "lstick", "rstick", "l", "r", "start", "back",
-    "dpad_left", "dpad_up", "dpad_right", "dpad_down", "zl", "zr", "lpaddle1", "rpaddle1", "lpaddle2", "rpaddle2"};
+    "dpad_left", "dpad_up", "dpad_right", "dpad_down", "zl", "zr", "lpaddle1", "rpaddle1", "lpaddle2", "rpaddle2",
+    "touchpad"};
 static const char *const key_names[KEY_COUNT] = {   // each group starts at its id; the ids of a group are consecutive
     [KEY_A] = "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u",
     "v", "w", "x", "y", "z",
@@ -65,13 +66,13 @@ const char *input_pad_name(int pad) { return pad > PAD_NONE && pad < PAD_COUNT ?
 
 void input_map_reset(void) { input_map = defaults; }
 
-static int key_id(const char *name) {
+int input_key_id(const char *name) {
     for (int k = KEY_A; k < KEY_COUNT; k++)
         if (key_names[k] && !strcasecmp(key_names[k], name)) return k;
     return KEY_NONE;
 }
 
-static int pad_id(const char *name) {
+int input_pad_id(const char *name) {
     for (int p = PAD_SOUTH; p < PAD_COUNT; p++)
         if (!strcasecmp(pad_names[p], name)) return p;
     return PAD_NONE;
@@ -132,12 +133,12 @@ int input_map_bind(const char *button, const char *list) {
         int ok = 0;
         if (!strncasecmp(tok, "pad:", 4) && action < B_SL_LEFT) {
             const char *name = trim(tok + 4);
-            int p = pad_id(name);
+            int p = input_pad_id(name);
             if (!strcasecmp(name, "default")) pad_def = ok = 1;
             else if (p && np < INPUT_PAD_BINDING_MAX) pads[np++] = (uint8_t)p, ok = 1;
         } else if (!strncasecmp(tok, "key:", 4)) {
             const char *name = trim(tok + 4);
-            int k = key_id(name);
+            int k = input_key_id(name);
             if (!strcasecmp(name, "default")) key_def = ok = 1;
             else if (k && nk < INPUT_BINDING_MAX) keys[nk++] = (uint8_t)k, ok = 1;
         }
@@ -166,11 +167,27 @@ int input_map_bind(const char *button, const char *list) {
 
 void input_map_configure(void) {
     input_map_reset();
+    uint8_t lined[ACTION_COUNT] = {0};
     for (int a = 0; a < ACTION_COUNT; a++) {
         char var[32];
         snprintf(var, sizeof var, "TOTK_BIND_%s", action_names[a]);
         const char *v = cfg_get(var);
-        if (v && *v && input_map_bind(action_names[a], v)) rt_log("input: %s = %s", var + 5, v);
+        if (v && *v && input_map_bind(action_names[a], v)) lined[a] = 1, rt_log("input: %s = %s", var + 5, v);
+    }
+    // A key a line binds leaves the defaults of the actions without a line, as the remapping rows move a key: with
+    // bind_X = key:t, T presses X only, not also Y, whose defaults hold it.
+    uint8_t bound[KEY_COUNT] = {0}, list[INPUT_BINDING_MAX];
+    for (int a = 0; a < ACTION_COUNT; a++) {
+        if (!lined[a]) continue;
+        int n = input_map_keys_of(&input_map, a, list, INPUT_BINDING_MAX);
+        for (int i = 0; i < n; i++) bound[list[i]] = 1;
+    }
+    for (int a = 0; a < ACTION_COUNT; a++) {
+        if (lined[a]) continue;
+        int n = input_map_keys_of(&input_map, a, list, INPUT_BINDING_MAX), w = 0;
+        for (int i = 0; i < n; i++)
+            if (!bound[list[i]]) list[w++] = list[i];
+        if (w < n) keys_put(&input_map, a, list, w);
     }
 }
 
@@ -290,12 +307,17 @@ int input_pad_layout_pick(const char *setting, int east_labelled_a) {
 
 int input_prompts_pick(const char *prompts, const char *pad_layout) {
     if (prompts && *prompts)
-        return !strcasecmp(prompts, "xbox") ? PROMPTS_XBOX : !strcasecmp(prompts, "pc") ? PROMPTS_PC : PROMPTS_NINTENDO;
+        return !strcasecmp(prompts, "xbox") ? PROMPTS_XBOX
+             : !strcasecmp(prompts, "playstation") || !strcasecmp(prompts, "ps") ? PROMPTS_PLAYSTATION
+             : !strcasecmp(prompts, "pc") ? PROMPTS_PC : PROMPTS_NINTENDO;
     return pad_layout && !strcasecmp(pad_layout, "xbox_prompts") ? PROMPTS_XBOX : PROMPTS_NINTENDO;
 }
 
 const char *input_prompts_folder(int prompts, const char *pad_layout) {
     if (prompts == PROMPTS_PC) return "romfs-patches-pc";
+    if (prompts == PROMPTS_PLAYSTATION)
+        return input_pad_layout_pick(pad_layout, 0) == PAD_LAYOUT_NINTENDO ? "romfs-patches-playstation"
+                                                                          : "romfs-patches-playstation-xbox";
     if (prompts != PROMPTS_XBOX) return NULL;
     // The folders are read at start, before a pad is open: auto counts as Xbox, as for a pad without Nintendo labels.
     // A Nintendo-labelled pad under auto plays by label too (its A is on the button labelled A), so it matches as well.

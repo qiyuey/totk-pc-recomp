@@ -21,6 +21,7 @@
 #include "ui/menu.h"
 #include "vk.h"
 #include "platform/platform.h"
+#include "gameplay_tweaks.h"
 
 enum { STICK_MAX = 32767, STICK_DIR = 16384, TRIGGER_ON = 16384, RESCAN_MS = 1000 };
 
@@ -33,6 +34,7 @@ static volatile int32_t g_block, g_menu;   // text entry / host menu: 0 off, 1 o
 enum { PAD_USED = 16384, MOUSE_USED = 6 };
 static volatile int32_t g_kbm_last = 1;
 int input_kbm_last(void) { return __atomic_load_n(&g_kbm_last, __ATOMIC_RELAXED); }
+int input_gameplay_active(void) { return !g_menu && !g_block && ikb_foreground() && ikb_captured(); }
 static SDL_Gamepad *pad;
 static uint64_t next_scan_ms;
 static volatile int32_t rumble_epoch;
@@ -44,9 +46,21 @@ static int pad_east_a;               // ... and labels its east face button A (N
 static int pad_layout = -1;          // PAD_LAYOUT_* in effect for the open gamepad, -1 to pick again; live (cfg_version)
 static unsigned pad_layout_seen;
 static volatile int32_t pad_layout_shown = -1;   // pad_layout for the menu (any thread), -1 without a gamepad
+// Steam Input: a game Steam starts gets SDL_GAMECONTROLLER_IGNORE_DEVICES, the vendor/product pairs of the controllers
+// Steam reads itself, and sees Steam's virtual gamepad in their place. That pad has no motion sensors, so a Steam
+// Controller, a Steam Deck or a DualSense under Steam Input gives no gyro. steam_reveal keeps the list here and clears
+// the hint: the buttons and sticks still come from the virtual pad (scan_pads skips the listed devices, so Steam's
+// remapping holds and nothing is read twice), and only the sensors come from the real controller (motion_source).
+enum { STEAM_HIDDEN_MAX = 64 };
+static uint16_t steam_hidden[STEAM_HIDDEN_MAX][2];   // vendor, product
+static int steam_hidden_n;
+static SDL_Gamepad *motion_extra;    // the hidden controller opened for its sensors only, NULL none
+static int pad_hidden;               // the open gamepad is a controller Steam hid (scan_pads' fallback)
+static uint64_t next_motion_scan;
 static SDL_JoystickID sensor_pad;    // the gamepad whose sensors the motion thread set up, 0 none
 static int sensor_ok;                // ... and it has both sensors, enabled
 static int motion_thread;            // 0 not started, 1 running, -1 off (TOTK_MOTION=0, no SDL)
+static char calib_pad_name[128];     // the controller the bias belongs to; empty when there is none
 
 // SDL buttons of the gamepad inputs (input_map.h PAD_*), by position; PAD_ZL and PAD_ZR are the triggers (axes).
 static const SDL_GamepadButton pad_sdl[PAD_COUNT] = {
@@ -58,9 +72,11 @@ static const SDL_GamepadButton pad_sdl[PAD_COUNT] = {
     [PAD_DPAD_RIGHT] = SDL_GAMEPAD_BUTTON_DPAD_RIGHT, [PAD_DPAD_DOWN] = SDL_GAMEPAD_BUTTON_DPAD_DOWN,
     [PAD_LPADDLE1] = SDL_GAMEPAD_BUTTON_LEFT_PADDLE1, [PAD_RPADDLE1] = SDL_GAMEPAD_BUTTON_RIGHT_PADDLE1,
     [PAD_LPADDLE2] = SDL_GAMEPAD_BUTTON_LEFT_PADDLE2, [PAD_RPADDLE2] = SDL_GAMEPAD_BUTTON_RIGHT_PADDLE2,
+    [PAD_TOUCHPAD] = SDL_GAMEPAD_BUTTON_TOUCHPAD,
 };
 
-// TOTK_INPUT_SCRIPT=<file>: lines "<frame> <button> [hold]" or "<frame> LSTICK|RSTICK <x> <y> [hold]", ORed into the real input.
+// TOTK_INPUT_SCRIPT=<file>: lines "<frame> <button> [hold]", "<frame> LSTICK|RSTICK <x> <y> [hold]", "<frame> MOUSE
+// <dx> <dy>" or "<frame> WHEEL <notches>" (+ away from the player), ORed into the real input.
 // <frame> and its hold are 60 Hz ticks of game time since the first present (frame_step_ticks: presents at 60 fps), so
 // the title menus get the presses at the same game time at any frame limit. A line "@<ms> ..." is timed instead: <ms>
 // and its hold are milliseconds of the world clock (frame_step_world_us, game time since the loaded save's first
@@ -77,6 +93,7 @@ static ScriptEv *script_ev;
 static int script_n, script_state;   // 0 not loaded, 1 loaded
 static int script_mixed;             // the script has timed lines: its untimed ones end where the world clock starts
 static int32_t script_mouse[2];      // one-shot raw counts, consumed by the camera hook; under lock
+static int32_t script_wheel;         // one-shot wheel notches, taken with the real ones (wheel_stick); under lock
 
 static void script_load(void) {
     script_state = 1;
@@ -99,7 +116,14 @@ static void script_load(void) {
         ScriptEv e = {.at = (uint64_t)(at * unit + 0.5), .hold = timed ? 66667 : 4, .bit = -1, .timed = timed};
         long a, b;
         double c;
-        if (!strcmp(name, "MOUSE") || !strcmp(name, "LSTICK") || !strcmp(name, "RSTICK")) {
+        if (!strcmp(name, "QUICKSAVE") || !strcmp(name, "QUICKLOAD")) {
+            e.stick = name[5] == 'S' ? 5 : 6, e.hold = 1;   // once, as quicksave's keys
+            snprintf(e.text, sizeof e.text, "%s", name);
+        } else if (!strcmp(name, "WHEEL")) {
+            if (sscanf(line + off, "%ld", &a) != 1) { rt_log("input: script line %d: WHEEL needs notches", ln); continue; }
+            e.stick = 4, e.x = (int32_t)a, e.hold = 1;   // one turn, never held
+            snprintf(e.text, sizeof e.text, "WHEEL %d", e.x);
+        } else if (!strcmp(name, "MOUSE") || !strcmp(name, "LSTICK") || !strcmp(name, "RSTICK")) {
             int n = sscanf(line + off, "%ld %ld %lf", &a, &b, &c);
             if (n < 2) { rt_log("input: script line %d: %s needs x y [hold]", ln, name); continue; }
             e.stick = name[0] == 'M' ? 3 : name[0] == 'L' ? 1 : 2; e.x = (int32_t)a; e.y = (int32_t)b;
@@ -125,6 +149,10 @@ static void script_load(void) {
     rt_log("input: script %s, %d events", path, script_n);
 }
 
+// Under lock: the Switch buttons the input script pressed in the last poll, apart from the keys' and the gamepad's, so
+// a gamepad combo can count a scripted press as the gamepad's without counting the keys bound to the same buttons
+static uint64_t script_seen;
+
 static void script_apply(uint64_t *b, int32_t sl[2], int32_t sr[2]) {
     if (!script_state) script_load();
     if (!script_n) return;
@@ -134,14 +162,18 @@ static void script_apply(uint64_t *b, int32_t sl[2], int32_t sr[2]) {
         ScriptEv *e = &script_ev[i];
         if (e->timed ? w < 0 : script_mixed && w >= 0) continue;
         uint64_t now = e->timed ? (uint64_t)w : tick;
-        if (now < e->at || (now >= e->at + e->hold && (e->logged || !e->timed))) continue;
-        if (e->stick == 3 && e->logged) continue;
+        // A one-shot (MOUSE, WHEEL) goes in at the first poll at or after its time: a poll that skips a tick (the
+        // game below 60 fps) would otherwise lose it
+        if (e->stick >= 3 ? e->logged || now < e->at
+                          : now < e->at || (now >= e->at + e->hold && (e->logged || !e->timed))) continue;
         if (!e->logged) {
             e->logged = 1;
             if (e->timed) rt_log("input: script frame %llu at %.1f ms: %s", (unsigned long long)fr, w / 1000.0, e->text);
             else rt_log("input: script frame %llu tick %llu: %s", (unsigned long long)fr, (unsigned long long)tick, e->text);
         }
-        if (e->stick == 3) {
+        if (e->stick >= 5) quicksave_request(e->stick == 6);
+        else if (e->stick == 4) script_wheel += e->x;
+        else if (e->stick == 3) {
             int64_t x = (int64_t)script_mouse[0] + e->x, y = (int64_t)script_mouse[1] + e->y;
             script_mouse[0] = (int32_t)(x < INT32_MIN ? INT32_MIN : x > INT32_MAX ? INT32_MAX : x);
             script_mouse[1] = (int32_t)(y < INT32_MIN ? INT32_MIN : y > INT32_MAX ? INT32_MAX : y);
@@ -242,7 +274,8 @@ static void rec_apply(uint64_t b, const int32_t sl[2], const int32_t sr[2]) {
 
 void input_direct_mouse_sample(int enabled, int32_t *dx, int32_t *dy) {
     plat_mutex_lock(&lock);
-    enabled = enabled && !g_block && !g_menu;
+    // the moving free camera takes the mouse (freecam_gate)
+    enabled = enabled && !g_block && !g_menu && freecam_state() != FREECAM_MOVE;
     *dx = script_mouse[0]; *dy = script_mouse[1];
     script_mouse[0] = script_mouse[1] = 0;
     if (!enabled) { *dx = *dy = 0; }
@@ -262,6 +295,17 @@ void input_direct_mouse_sample(int enabled, int32_t *dx, int32_t *dy) {
         fflush(rec);
     }
     plat_mutex_unlock(&lock);
+}
+
+// A turn of the real wheel as a WHEEL line of the recording (one-shot, as a MOUSE line). Under lock.
+static void rec_wheel(int32_t notches) {
+    if (rec_state != 1) return;
+    char what[32];
+    snprintf(what, sizeof what, "WHEEL %d", notches);
+    int64_t w = frame_step_world_us();
+    uint64_t tick = frame_step_ticks();
+    rec_line(tick, w, tick + 1, w, what);
+    fflush(rec);
 }
 
 static float mouse_sens = -1;              // TOTK_MOUSE_SENS, 0 = mouse camera off; live (cfg_version)
@@ -326,6 +370,14 @@ static void walk_get(void) {
 static int mouse_selector;
 int input_direct_mouse_selector_active(void) { return __atomic_load_n(&mouse_selector, __ATOMIC_RELAXED) != 0; }
 
+// A script's MOUSE line within the last 100 ms (under `lock`): mouse_camera then makes a stick of it
+static uint64_t script_mouse_at;
+static int input_script_mouse_recent(void) {
+    uint64_t now = plat_now_ns();
+    if (script_mouse[0] || script_mouse[1]) script_mouse_at = now;
+    return script_mouse_at && now - script_mouse_at < 100000000ull;
+}
+
 // Selector 1 is a radial wheel, 2..4 are distinct horizontal quick lists; only a wheel retains a virtual cursor.
 // Under `lock`.
 static void mouse_camera(int32_t out[2], int selector) {
@@ -358,7 +410,10 @@ static void mouse_camera(int32_t out[2], int selector) {
         frame = ~0ull;
         return;   // the camera update takes the raw counts itself, once, outside the HID stick path
     }
-    if (!ikb_captured()) {
+    // A script's MOUSE lines move the stick as the mouse does, captured or not (in direct mode the camera hook takes
+    // them, input_direct_mouse_sample): for 100 ms after one the stick is the mouse's, as while captured
+    int scripted = input_script_mouse_recent();
+    if (!ikb_captured() && !scripted) {
         ikb_mouse_take(&dx, &dy);
         held[0] = held[1] = 0;
         frame = ~0ull;
@@ -368,6 +423,9 @@ static void mouse_camera(int32_t out[2], int selector) {
         if (fr != frame) {
             double dt = age < 0.004 ? 0.004 : age > 0.1 ? 0.1 : age;
             ikb_mouse_take(&dx, &dy);
+            if (!ikb_captured()) dx = dy = 0;
+            dx += script_mouse[0], dy += script_mouse[1];
+            script_mouse[0] = script_mouse[1] = 0;
             input_mouse_stick(dx, dy, dt, mouse_sens_get(), held);
             frame = fr;
             t0 = now;
@@ -399,22 +457,105 @@ static void stick(SDL_GamepadAxis ax, SDL_GamepadAxis ay, float dead, int32_t ou
     input_pad_stick(SDL_GetGamepadAxis(pad, ax), -(int32_t)SDL_GetGamepadAxis(pad, ay), dead, out);
 }
 
-// Open the first gamepad when none is open or the open one went away; logs once per change.
+// Before SDL_Init: keep the controllers Steam hid (steam_hidden) and let SDL open them. The list is
+// "0xVVVV/0xPPPP,..." (SDL's own format). With motion off (TOTK_MOTION=0 at start) Steam's list stays in force.
+static void steam_reveal(void) {
+    const char *e = getenv("SDL_GAMECONTROLLER_IGNORE_DEVICES");
+    if (!e || !*e || !cfg_bool("TOTK_MOTION")) return;
+    for (const char *s = e; *s && steam_hidden_n < STEAM_HIDDEN_MAX;) {
+        unsigned v, p;
+        int used = 0;
+        if (sscanf(s, " %x/%x%n", &v, &p, &used) == 2 && used > 0) {
+            steam_hidden[steam_hidden_n][0] = (uint16_t)v;
+            steam_hidden[steam_hidden_n][1] = (uint16_t)p;
+            steam_hidden_n++;
+            s += used;
+        }
+        const char *c = strchr(s, ',');
+        if (!c) break;
+        s = c + 1;
+    }
+    if (!steam_hidden_n) return;
+    // The environment outranks a hint of normal priority, so this one overrides it
+    SDL_SetHintWithPriority(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES, "", SDL_HINT_OVERRIDE);
+    rt_log("input: Steam Input hides %d controller type(s); buttons stay on Steam's virtual gamepad, motion is read "
+           "from the controller itself", steam_hidden_n);
+}
+
+// The ids the device itself reports. SDL_GetGamepadVendorForID and ...ProductForID give a Steam virtual pad the ids of
+// the controller behind it, which would make it look like a controller Steam hid; the GUID keeps the device's own.
+static void raw_ids(SDL_JoystickID id, uint16_t *v, uint16_t *p) {
+    SDL_GetJoystickGUIDInfo(SDL_GetGamepadGUIDForID(id), v, p, NULL, NULL);
+}
+
+static int steam_hidden_id(SDL_JoystickID id) {
+    uint16_t v, p;
+    raw_ids(id, &v, &p);
+    for (int i = 0; i < steam_hidden_n; i++)
+        if (steam_hidden[i][0] == v && steam_hidden[i][1] == p) return 1;
+    return 0;
+}
+
+
+// Steam's virtual gamepad: Valve's vendor id with product 0x11ff in the device's own ids (raw_ids; SDL's
+// SDL_IsJoystickSteamVirtualGamepad is not public)
+static int steam_virtual(SDL_Gamepad *g) {
+    uint16_t v, p;
+    raw_ids(SDL_GetGamepadID(g), &v, &p);
+    return v == 0x28de && p == 0x11ff;
+}
+
+static int has_motion(SDL_Gamepad *g) {
+    return SDL_GamepadHasSensor(g, SDL_SENSOR_GYRO) && SDL_GamepadHasSensor(g, SDL_SENSOR_ACCEL);
+}
+
+// A gamepad Steam did not hide is connected (Steam's virtual pad, or another controller).
+static int unhidden_pad_present(void) {
+    int n = 0, found = 0;
+    SDL_JoystickID *ids = SDL_GetGamepads(&n);
+    for (int i = 0; ids && i < n && !found; i++) found = !steam_hidden_id(ids[i]);
+    SDL_free(ids);
+    return found;
+}
+
+// Open the first gamepad when none is open or the open one went away; logs once per change. A controller Steam hid
+// (steam_hidden) is taken only when no other gamepad is there, e.g. while Steam's virtual pad is not up yet, and gives
+// way to the virtual pad once it is (pad_physical looks again every RESCAN_MS while pad_hidden): otherwise Steam's
+// remapping would be lost for the session. The hidden controller then stays open for its sensors (motion_extra), so
+// its bias and orientation go on.
 static void scan_pads(void) {
-    if (pad && SDL_GamepadConnected(pad)) return;
+    if (pad && SDL_GamepadConnected(pad)) {
+        if (!pad_hidden || !unhidden_pad_present()) return;
+        rt_log("input: Steam Input's virtual gamepad is up: buttons move to it from \"%s\"", SDL_GetGamepadName(pad));
+        if (!motion_extra && has_motion(pad)) motion_extra = pad;
+        else SDL_CloseGamepad(pad);
+        pad = NULL;
+        pad_hidden = 0;
+        plat_inc32(&rumble_epoch);
+    }
     if (pad) {
         plat_inc32(&rumble_epoch);
         SDL_CloseGamepad(pad); pad = NULL; sensor_pad = 0; sensor_ok = 0;
+        // Its bias and an attempt collecting from it go with it; the next pad gets its own in pad_bias_select.
+        motion_bias_reset(motion_global());
+        calib_pad_name[0] = 0;
         plat_xchg32(&pad_layout_shown, -1);
         for (int i = 0; i < 4; i++) plat_xchg32(&pad_labels[i], PAD_LABEL_NONE);
         rt_log("input: gamepad disconnected");
     }
     int n = 0;
     SDL_JoystickID *ids = SDL_GetGamepads(&n);
-    for (int i = 0; ids && i < n && !pad; i++) pad = SDL_OpenGamepad(ids[i]);
+    for (int pass = 0; pass < 2 && !pad; pass++)
+        for (int i = 0; ids && i < n && !pad; i++)
+            if (steam_hidden_id(ids[i]) == pass) {
+                // The controller motion_source holds for its sensors serves as the pad too: one open handle
+                if (motion_extra && SDL_GetGamepadID(motion_extra) == ids[i]) { pad = motion_extra; motion_extra = NULL; }
+                else pad = SDL_OpenGamepad(ids[i]);
+            }
     SDL_free(ids);
     if (!pad) return;
     plat_inc32(&rumble_epoch);
+    pad_hidden = steam_hidden_n && steam_hidden_id(SDL_GetGamepadID(pad));
     pad_rumble = SDL_GetBooleanProperty(SDL_GetGamepadProperties(pad), SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false);
     pad_east_a = SDL_GetGamepadButtonLabel(pad, SDL_GAMEPAD_BUTTON_EAST) == SDL_GAMEPAD_BUTTON_LABEL_A;
     for (int i = 0; i < 4; i++) {
@@ -431,16 +572,20 @@ static void scan_pads(void) {
     }
     pad_layout = -1;
     int motion = SDL_GamepadHasSensor(pad, SDL_SENSOR_GYRO) && SDL_GamepadHasSensor(pad, SDL_SENSOR_ACCEL);
-    rt_log("input: gamepad \"%s\" (%s, %s, east button %s)", SDL_GetGamepadName(pad), pad_rumble ? "rumble" : "no rumble",
+    uint16_t rv, rp;
+    raw_ids(SDL_GetGamepadID(pad), &rv, &rp);
+    rt_log("input: gamepad \"%s\" %04x:%04x%s (%s, %s, east button %s)", SDL_GetGamepadName(pad), rv, rp,
+           steam_virtual(pad) ? " Steam Input" : "", pad_rumble ? "rumble" : "no rumble",
            motion ? "gyro and accelerometer" : "no motion sensors", pad_east_a ? "labelled A" : "not labelled A");
 }
 
 // Under lock, state 1. Input and rumble share one retry deadline while the pad is absent.
 static void poll_pads(void) {
     SDL_UpdateGamepads();
-    if (pad && SDL_GamepadConnected(pad)) return;
+    int connected = pad && SDL_GamepadConnected(pad);
+    if (connected && !pad_hidden) return;
     uint64_t now_ms = plat_now_ns() / 1000000u;
-    if (pad || now_ms >= next_scan_ms) {
+    if ((pad && !connected) || now_ms >= next_scan_ms) {
         scan_pads();
         next_scan_ms = now_ms + RESCAN_MS;
     }
@@ -485,6 +630,20 @@ static void binds_refresh(void) {
 // TOTK_TEST_PAD=<lx>,<ly>,<rx>,<ry> (test runs): an SDL virtual gamepad whose sticks rest at these raw SDL axis values
 // (-32768..32767, down is +y), attached before the first scan so it is the gamepad the game reads: drift and full
 // deflection go through the same mapping and dead zone as a real pad.
+// TOTK_TEST_PAD_RUMBLE_MS=<n>: the test gamepad has rumble and each write to it takes n ms (a slow Bluetooth HID write),
+// to show that input_rumble does not wait for it. Read with cfg_get, as TOTK_TEST_PAD is: a test variable has no row in
+// the settings table, and cfg_int stops the game on a name without one.
+static int test_pad_rumble_ms(void) {
+    const char *e = cfg_get("TOTK_TEST_PAD_RUMBLE_MS");
+    return e ? atoi(e) : 0;
+}
+
+static bool test_pad_rumble(void *userdata, Uint16 low, Uint16 high) {
+    (void)userdata; (void)low; (void)high;
+    plat_wait_ns((uint64_t)test_pad_rumble_ms() * 1000000ull);
+    return true;
+}
+
 static void test_pad_attach(void) {
     static SDL_Joystick *joy;   // kept open: a virtual joystick's axes are set through an open handle
     const char *e = cfg_get("TOTK_TEST_PAD");
@@ -500,6 +659,7 @@ static void test_pad_attach(void) {
     d.naxes = SDL_GAMEPAD_AXIS_COUNT;
     d.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
     d.name = "TotK test gamepad";
+    if (test_pad_rumble_ms() > 0) d.Rumble = test_pad_rumble;
     SDL_JoystickID id = SDL_AttachVirtualJoystick(&d);
     joy = id ? SDL_OpenJoystick(id) : NULL;
     if (!joy) {
@@ -518,6 +678,14 @@ static void start(void) {
     const char *e = cfg_get("TOTK_INPUT");
     if (e && !strcmp(e, "none")) { state = -1; rt_log("input: disabled (TOTK_INPUT=none)"); return; }
     SDL_SetHintWithPriority("SDL_JOYSTICK_HIDAPI_SWITCH2_EXPERIMENTAL_HD", "1", SDL_HINT_DEFAULT);
+    steam_reveal();
+    // SDL drops gamepad button presses and stick movements (and leaves the polled state unchanged) while its own
+    // window lacks keyboard focus (SDL_PrivateJoystickShouldIgnoreEvent in SDL_joystick.c; centring and releases
+    // pass). That applies where the window is SDL's (Linux); the Win32 window on Windows is not an SDL window. The
+    // game keeps running out of focus by default (TOTK_ASSUME_FOCUS, ov_system.c oe_set_focus), so the gamepad has to
+    // keep working there. With the setting off the game's main thread waits while unfocused and reads no input, so
+    // the hint can stay on for the whole run.
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     if (!SDL_Init(SDL_INIT_GAMEPAD)) { state = -1; rt_log("input: SDL gamepad init failed (%s), keyboard only", SDL_GetError()); }
     else state = 1;
     if (state == 1) test_pad_attach();
@@ -558,55 +726,240 @@ static int32_t shake_stick(int held) {
     return (now - from) / SHAKE_SIDE_NS % 2 ? STICK_MAX : -STICK_MAX;
 }
 
-// The scroll wheel on the Purah Pad's map, which zooms with the right stick's y (up: in): each notch is a full-tilt
-// pulse of MAP_ZOOM_PULSE_NS on that stick with MAP_ZOOM_GAP_NS of neutral after it, so a step of the zoom and a
-// held zoom both see one notch as one push. A fast scroll's notches wait their turn (at most MAP_ZOOM_QUEUE), a turn the
-// other way drops them. Returns the stick y for this poll, 0 between pulses and off the map. Under lock.
-#define MAP_ZOOM_PULSE_NS 100000000ull
-#define MAP_ZOOM_GAP_NS 50000000ull
-#define MAP_ZOOM_QUEUE 4
-static int32_t map_zoom_stick(int32_t notches, int on_map) {
+// The scroll wheel (ikb_wheel_take, and an input script's WHEEL lines) as the stick a gamepad player would move:
+//  - on the Purah Pad's map it zooms: the right stick's y, away from the player zooming in;
+//  - while a D-pad strip (weapons, shields, bows, materials) is held open it steps the choice: the right stick's x, away
+//    from the player to the left, towards the player to the right;
+//  - in a menu with the game's focus box (the inventory, shops, Options, the save list; menu_cursor_menu) it steps the
+//    focus: the left stick's y, away from the player up;
+//  - in the Purah Pad's camera (menu_cursor_camera) it zooms: the D-pad's up (away from the player, in) or down, the
+//    buttons its guide shows for the zoom.
+// Each notch is a full-tilt pulse with neutral after it (wheel_timing), so the game sees one notch as one step, and a
+// fast scroll's notches wait their turn (at most WHEEL_QUEUE); a turn the other way drops them. A strip's pulse is the
+// mouse's (input_direct_mouse_row: 32 ms each way); a menu takes the stick on its own update, a frame of the game's
+// 30 Hz or less, so its pulse covers two. Elsewhere, and while the settings menu is open, the notches are dropped.
+enum { WHEEL_NONE, WHEEL_MAP, WHEEL_STRIP, WHEEL_MENU, WHEEL_CAMERA };
+static const struct { uint64_t pulse_ns, gap_ns; } wheel_timing[] = {
+    [WHEEL_MAP] = {100000000ull, 50000000ull}, [WHEEL_STRIP] = {32000000ull, 32000000ull},
+    [WHEEL_MENU] = {70000000ull, 50000000ull}, [WHEEL_CAMERA] = {100000000ull, 50000000ull}};
+#define WHEEL_QUEUE 4
+#define WHEEL_GAP_NS 300000000ull   // a menu's focus gap (a tab switch): queued notches wait this long for its next screen
+
+// The stick value for this poll at the place `where` (WHEEL_*): -STICK_MAX, 0 or STICK_MAX. Under lock.
+static int32_t wheel_stick(int32_t notches, int where) {
     static int32_t queued, dir;
-    static uint64_t until;   // the end of the pulse (dir != 0) or of the neutral after it
+    static int place;
+    static uint64_t until, none_since;   // until: the end of the pulse (dir != 0) or of the neutral after it
     uint64_t now = plat_now_ns();
-    if (!on_map) { queued = dir = 0, until = 0; return 0; }
+    if (where == WHEEL_NONE) {
+        if (!none_since) none_since = now;
+        if (now - none_since > WHEEL_GAP_NS) queued = 0, place = WHEEL_NONE;
+        dir = 0;
+        return 0;
+    }
+    none_since = 0;
+    if (where != place) queued = dir = 0, until = 0, place = where;
     if (notches) {
         if (queued && (notches > 0) != (queued > 0)) queued = 0;
         queued += notches;
-        queued = queued > MAP_ZOOM_QUEUE ? MAP_ZOOM_QUEUE : queued < -MAP_ZOOM_QUEUE ? -MAP_ZOOM_QUEUE : queued;
+        queued = queued > WHEEL_QUEUE ? WHEEL_QUEUE : queued < -WHEEL_QUEUE ? -WHEEL_QUEUE : queued;
     }
     if (dir) {
         if (now < until) return dir * STICK_MAX;
-        dir = 0, until = now + MAP_ZOOM_GAP_NS;
+        dir = 0, until = now + wheel_timing[where].gap_ns;
         return 0;
     }
     if (now < until || !queued) return 0;
     dir = queued > 0 ? 1 : -1;
     queued -= dir;
-    until = now + MAP_ZOOM_PULSE_NS;
+    until = now + wheel_timing[where].pulse_ns;
     return dir * STICK_MAX;
+}
+
+// After the keys, the gamepad and the script: where the wheel goes this poll (b holds the script's D-pad too, so a
+// scripted strip takes scripted notches). Under lock.
+static void wheel_route(uint64_t *bp, int32_t sl[2], int32_t sr[2]) {
+    uint64_t b = *bp;
+    int32_t real = state > 0 ? ikb_wheel_take() : 0, notches = real + script_wheel;   // the script's under TOTK_INPUT=none too
+    script_wheel = 0;
+    if (menu_is_open()) notches = 0;
+    if (real && notches) {
+        __atomic_store_n(&g_kbm_last, 1, __ATOMIC_RELAXED);   // the pointer comes to a menu the wheel turns in
+        rec_wheel(real);
+    }
+    // A strip is its D-pad direction held with its screen open; with the menu cursor off (the screens not read,
+    // menu_cursor_shortcut -1) the buttons alone decide, as for the mouse's selectors
+    int sc = b & (1ull << B_UP | 1ull << B_LEFT | 1ull << B_RIGHT) && !(b & 1ull << B_L) ? menu_cursor_shortcut() : 0;
+    int strip = sc == -1 || sc == 1 || (sc == 0 && menu_cursor_strip());
+    int where = menu_cursor_map()      ? WHEEL_MAP
+                : strip                ? WHEEL_STRIP
+                : menu_cursor_camera() ? WHEEL_CAMERA
+                : menu_cursor_menu()   ? WHEEL_MENU
+                                       : WHEEL_NONE;
+    if (where == WHEEL_MAP && gameplay_tweaks_map_zoom()) where = WHEEL_NONE;
+    else if (where == WHEEL_STRIP && gameplay_tweaks_strip_wheel(b)) where = WHEEL_NONE;
+    int32_t v = wheel_stick(notches, where);
+    if (!v) return;
+    if (where == WHEEL_CAMERA) *bp |= 1ull << (v > 0 ? B_UP : B_DOWN);
+    else if (where == WHEEL_MAP) pick(&sr[0], &sr[1], 0, v);
+    else if (where == WHEEL_STRIP) pick(&sr[0], &sr[1], -v, 0);
+    else pick(&sl[0], &sl[1], 0, v);
 }
 
 // Under lock, state 1: the open gamepad's inputs by position (pd[PAD_*] != 0 held); 0 without a connected gamepad.
 static int pad_physical(uint8_t pd[PAD_COUNT]) {
     poll_pads();
-    if (!pad) return 0;
+    if (!pad || !SDL_GamepadConnected(pad)) return 0;
     for (int p = PAD_SOUTH; p < PAD_ZL; p++) pd[p] = SDL_GetGamepadButton(pad, pad_sdl[p]);
     pd[PAD_ZL] = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > TRIGGER_ON;
     pd[PAD_ZR] = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > TRIGGER_ON;
-    for (int p = PAD_ZR + 1; p < PAD_COUNT; p++) pd[p] = SDL_GetGamepadButton(pad, pad_sdl[p]);   // false without paddles
+    for (int p = PAD_ZR + 1; p < PAD_COUNT; p++) pd[p] = SDL_GetGamepadButton(pad, pad_sdl[p]);   // false without paddles or touchpad
     return 1;
 }
 
 // Under lock, state 1: the open gamepad's buttons (Switch bits after TOTK_PAD_LAYOUT and the TOTK_BIND_* lines) and
 // sticks; 0 without a connected gamepad.
+// Under lock: the last pad_read's inputs by position, [PAD_GUIDE] the Home / Guide button (no Switch button), and its
+// left and right trigger axes, 0..32767: what the gamepad combos and the free camera read
+#define PAD_GUIDE PAD_COUNT
+static uint8_t pad_seen[PAD_COUNT + 1];
+static int16_t trigger_seen[2];
+
 static int pad_read(uint64_t *b, int32_t sl[2], int32_t sr[2]) {
     uint8_t pd[PAD_COUNT] = {0};
-    if (!pad_physical(pd)) return 0;
+    if (!pad_physical(pd)) {
+        memset(pad_seen, 0, sizeof pad_seen);
+        memset(trigger_seen, 0, sizeof trigger_seen);
+        return 0;
+    }
+    memcpy(pad_seen, pd, sizeof pd);
+    pad_seen[PAD_GUIDE] = SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_GUIDE);
+    trigger_seen[0] = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER);
+    trigger_seen[1] = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER);
     *b |= input_map_pad_buttons(pd, pad_layout_get());
     stick(SDL_GAMEPAD_AXIS_LEFTX, SDL_GAMEPAD_AXIS_LEFTY, stick_dead_get(0), sl);
     stick(SDL_GAMEPAD_AXIS_RIGHTX, SDL_GAMEPAD_AXIS_RIGHTY, stick_dead_get(1), sr);
     return 1;
+}
+
+uint32_t input_pad_combo(const char *env, const char *s) {
+    uint32_t mask = 0;
+    char name[32];
+    size_t n = 0;
+    for (const char *c = s;; c++) {
+        if (*c && *c != '+' && *c != ' ') {
+            if (n < sizeof name - 1) name[n++] = *c;
+            continue;
+        }
+        if (n) {
+            name[n] = 0;
+            int p = !strcasecmp(name, "guide") || !strcasecmp(name, "home") ? PAD_GUIDE : input_pad_id(name);
+            if (p == PAD_NONE) {
+                rt_log("input: %s=%s: %s is not a gamepad button (south east west north lstick rstick "
+                       "l r zl zr start back guide dpad_*, paddles)", env, s, name);
+                return 0;
+            }
+            mask |= 1u << p;
+            n = 0;
+        }
+        if (!*c) break;
+    }
+    return mask;
+}
+
+// TOTK_FREECAM_PAD (live): the combo that switches the free camera (freecam.c), for example zl+zr+lstick (LT+RT+L3);
+// none, the default (the settings table), for no combo. Under lock.
+static uint32_t freecam_pad_mask(void) {
+    static unsigned seen;
+    static int read;
+    static uint32_t mask;
+    unsigned v = cfg_version();
+    if (read && v == seen) return mask;
+    read = 1, seen = v;
+    const char *s = cfg_value("TOTK_FREECAM_PAD");
+    mask = *s && strcasecmp(s, "none") ? input_pad_combo("TOTK_FREECAM_PAD", s) : 0;
+    return mask;
+}
+
+// TOTK_FREECAM_KEY (live): the key that switches the free camera; none, the default (the settings table), for no key.
+// Under lock.
+static int freecam_key(void) {
+    static unsigned seen;
+    static int read, key;
+    unsigned v = cfg_version();
+    if (read && v == seen) return key;
+    read = 1, seen = v;
+    const char *s = cfg_value("TOTK_FREECAM_KEY");
+    key = !*s || !strcasecmp(s, "none") ? KEY_NONE : input_key_id(s);
+    if (key == KEY_NONE && *s && strcasecmp(s, "none"))
+        rt_log("input: TOTK_FREECAM_KEY=%s is not a key name (docs/controls.md)", s);
+    return key;
+}
+
+static float trigger_unit(int16_t v) {   // 0..1 past a 5 % dead zone
+    float t = v / 32767.0f;
+    return t < 0.05f ? 0 : (t - 0.05f) / 0.95f;
+}
+
+// The free camera combo, latched like Minus+Plus (input_map.c, chord): once every button of it is down (on the gamepad,
+// or pressed by an input script) the free camera steps once (off, move, lock), and the buttons stay hidden from the
+// game until all are released; the free camera key steps it on its press. While the free camera moves it gets the
+// input and the game gets nothing, so Link stands still: the sticks (the keys' sticks merged into sl and sr), the
+// trigger axes or else ZL and ZR as buttons, a press of L or R as a speed click, and the mouse's motion, which
+// input_direct_mouse_sample then keeps from the game's camera. ZL, ZR, L and R are the merged Switch buttons, so the
+// keys bound to them count. Locked, the game gets the input as it is (freecam.c: the game steers Link by the camera it
+// draws). Off for other updates and with the freecam patch set off. Under lock.
+static void freecam_gate(uint64_t *b, int32_t sl[2], int32_t sr[2]) {
+    static int held, key_held, available = -1, shoulder[2];
+    if (available < 0) available = freecam_available();
+    uint32_t mask = available ? freecam_pad_mask() : 0, raw = 0;
+    int layout = pad_layout_get();
+    for (int p = PAD_SOUTH; p <= PAD_GUIDE; p++) {
+        if (!(mask >> p & 1)) continue;
+        // A position counts as down on the gamepad or when the input script presses the Switch buttons it stands for,
+        // as a gamepad would; the keys bound to those buttons do not (the free camera key is theirs). Home has no
+        // Switch button: gamepad only.
+        uint8_t one[PAD_COUNT] = {0};
+        if (p < PAD_COUNT) one[p] = 1;
+        if (pad_seen[p] || (p < PAD_COUNT && script_seen & input_map_pad_buttons(one, layout))) raw |= 1u << p;
+    }
+    if (!mask) held = 0;
+    else if (held) held = raw != 0;
+    else if (raw == mask) {
+        held = 1;
+        freecam_cycle();
+    }
+    int key = available ? freecam_key() : KEY_NONE;
+    int key_down = key != KEY_NONE && ikb_foreground() && ikb_down(key);
+    if (key_down && !key_held) freecam_cycle();
+    key_held = key_down;
+    if (available && freecam_state() == FREECAM_MOVE) {
+        float lt = trigger_unit(trigger_seen[0]), rt = trigger_unit(trigger_seen[1]);
+        if (*b >> B_ZL & 1) lt = 1;
+        if (*b >> B_ZR & 1) rt = 1;
+        FreecamPad fp = {sl[0] / (float)STICK_MAX, sl[1] / (float)STICK_MAX, sr[0] / (float)STICK_MAX,
+                         sr[1] / (float)STICK_MAX, lt, rt};
+        freecam_pad(&fp);
+        for (int k = 0; k < 2; k++) {
+            int down = (int)(*b >> (k ? B_R : B_L) & 1);
+            if (down && !shoulder[k]) freecam_speed_click(k);
+            shoulder[k] = down;
+        }
+        if (ikb_captured() && ikb_foreground() && input_cursor_allowed()) {
+            int32_t x, y;
+            ikb_mouse_take(&x, &y);   // what the stick emulation left (none in that mode: it is in sr already)
+            float deg = 0.08f * mouse_sens_get();   // the game camera's rate a count (mouse_direct.c DEG_PER_COUNT)
+            if (x || y) freecam_mouse(x * deg, y * deg);
+        }
+        *b = 0;
+        sl[0] = sl[1] = sr[0] = sr[1] = 0;
+        return;
+    }
+    shoulder[0] = shoulder[1] = 1;   // a shoulder held when the free camera starts is no click
+    if (!held) return;
+    uint8_t sub[PAD_COUNT] = {0};
+    for (int p = PAD_SOUTH; p < PAD_COUNT; p++) sub[p] = mask >> p & 1;
+    *b &= ~input_map_pad_buttons(sub, pad_layout_get());
 }
 
 int input_pad_stick_percent(double pct[2]) {
@@ -639,19 +992,51 @@ static void poll_merged(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx
         if (ikb_foreground()) {
             uint8_t down[KEY_COUNT] = {0};
             // Mouse buttons count only while the cursor is captured, and a button already held when the capture began
-            // (the click that refocused the window) is ignored until it is released.
+            // (the click that refocused the window) is ignored until it is released. While a game menu has the pointer
+            // (menu_cursor.c) and it is over the window, the left and right buttons are that menu's A and B, and the
+            // middle and side buttons keep their bindings: bound to L and R they turn the menu's tabs.
             static int was_captured;
             static uint8_t mouse_ignore[KEY_COUNT];
             int cap = ikb_captured();
+            float pointer_x, pointer_y;
+            int menu_pointer = !cap && menu_cursor_pointer() && ikb_pointer(&pointer_x, &pointer_y);
             for (int k = 1; k < KEY_COUNT; k++) {
                 down[k] = ikb_down(k);
                 kbm_used |= down[k];
                 if (k < KEY_MOUSE_L || k > KEY_MOUSE_X2) continue;
                 if (cap && !was_captured) mouse_ignore[k] = down[k];
                 if (!down[k]) mouse_ignore[k] = 0;
-                if (!cap || mouse_ignore[k]) down[k] = 0;
+                int counts = cap || (menu_pointer && k != KEY_MOUSE_L && k != KEY_MOUSE_R);
+                if (!counts || mouse_ignore[k]) down[k] = 0;
             }
             was_captured = cap;
+            // On the Purah Pad's map (menu_cursor.c finds it, TOTK_MAP_CLICK) the left mouse button presses A at the
+            // map's cursor, which the mouse moves there, instead of its binding (Y by default). A press is one or the
+            // other from the moment it goes down until it is released, so a button held as the map opens or closes
+            // keeps what it pressed.
+            static int map_held, map_a;
+            if (!down[KEY_MOUSE_L]) map_held = map_a = 0;
+            else if (!map_held) map_held = 1, map_a = menu_cursor_map() && cfg_bool("TOTK_MAP_CLICK");
+            if (map_a) down[KEY_MOUSE_L] = 0, b |= 1ull << B_A;
+            // While a dialogue box is on screen (menu_cursor.c, TOTK_DIALOGUE_CLICK) the left mouse button presses B,
+            // which advances the text and also shows the rest of a line at once, and the right one presses A, instead
+            // of their bindings: Y by default, which opens the dialogue log there, and ZL. A press is one or the other
+            // from the moment it goes down until it is released, so a click that closes the last box does not turn
+            // into an attack while it is still held, and a button held as the box opens does not skip its first line.
+            // Dialogue choices have the pointer, and their clicks are menu_cursor.c's: a left click there is A.
+            static const uint8_t click_key[2] = {KEY_MOUSE_L, KEY_MOUSE_R}, click_btn[2] = {B_B, B_A};
+            static int click_held[2], click_talk[2];
+            for (int i = 0; i < 2; i++) {
+                int key = click_key[i];
+                if (!down[key]) click_held[i] = click_talk[i] = 0;
+                else if (!click_held[i]) click_held[i] = 1, click_talk[i] = menu_cursor_dialogue();
+                if (click_talk[i]) down[key] = 0, b |= 1ull << click_btn[i];
+            }
+            // The quick save and quick load keys are quicksave's while it is on (quicksave.c): they reach no binding
+            // then, and do nothing while the settings menu or a text entry is open
+            if (quicksave_on()) quicksave_keys(down, !g_menu && !g_block);
+            if (cap && !g_menu && !g_block) gameplay_tweaks_prepare_keys(down, b);
+            else gameplay_tweaks_reset();
             b |= input_map_buttons(down);
             int32_t k[2];
             walk_get();
@@ -669,13 +1054,10 @@ static void poll_merged(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx
             // Before the screens were read (the menu cursor off) the buttons alone decide, as before.
             if (selector && menu_cursor_shortcut() == 0) selector = 0;
             mouse_camera(k, selector);
-            // On the map the left stick moves the cursor and the right one zooms: the mouse moves the cursor there,
-            // the scroll wheel zooms (map_zoom_stick). Elsewhere the wheel is unbound; its notches are dropped.
-            int map = menu_cursor_map();
-            if (map) pick(&sl[0], &sl[1], k[0], k[1]);
+            // On the map the left stick moves the cursor and the right one zooms: the mouse moves the cursor there
+            // (the scroll wheel zooms, wheel_route)
+            if (menu_cursor_map()) pick(&sl[0], &sl[1], k[0], k[1]);
             else pick(&sr[0], &sr[1], k[0], k[1]);
-            int32_t zoom = map_zoom_stick(ikb_wheel_take(), map);
-            if (zoom) pick(&sr[0], &sr[1], 0, zoom);
             int32_t shake = shake_stick(input_map_held(down, B_SHAKE));
             if (shake) sr[0] = shake, sr[1] = 0;
             // A mouse shake (mouse_direct.c) moves the stick with the mouse, side by side, and lets go when it rests
@@ -689,7 +1071,18 @@ static void poll_merged(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx
         if (pad_used) __atomic_store_n(&g_kbm_last, 0, __ATOMIC_RELAXED);
         else if (kbm_used) __atomic_store_n(&g_kbm_last, 1, __ATOMIC_RELAXED);
     }
-    script_apply(&b, sl, sr);
+    // Without the keyboard and mouse poll above (TOTK_INPUT=none in scripted runs, or the window in the background), a
+    // script's MOUSE lines still move the right stick wherever the mouse would (mouse_camera)
+    if (!(state > 0 && ikb_foreground()) && input_script_mouse_recent() && !input_direct_mouse_active()) {
+        int32_t k[2];
+        mouse_camera(k, 0);
+        pick(&sr[0], &sr[1], k[0], k[1]);
+    }
+    script_seen = 0;
+    script_apply(&script_seen, sl, sr);
+    b |= script_seen;
+    wheel_route(&b, sl, sr);
+    gameplay_tweaks_apply(__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED), input_gameplay_active(), &b, &sl[0], &sl[1], &sr[0], &sr[1]);
     rec_apply(b, sl, sr);
     // Minus and Plus held together (gamepad or keys) open or close the menu and never reach the game
     static int combo_held;
@@ -698,6 +1091,7 @@ static void poll_merged(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx
     static int overlay_held;   // L3+R3 step the performance overlay (F10)
     int overlay = input_overlay_gate(&overlay_held, &b);
     sl[0] = st[0], sl[1] = st[1], sr[0] = st[2], sr[1] = st[3];
+    freecam_gate(&b, sl, sr);   // TOTK_FREECAM_PAD steps the free camera, which takes the pad while moving (freecam.c)
     plat_mutex_unlock(&lock);
     if (toggle) menu_toggle();
     if (overlay) menu_perf_cycle();
@@ -721,10 +1115,12 @@ static volatile uint64_t g_block_closed, g_menu_closed;
 
 int input_cursor_allowed(void) {
     const char *in = cfg_get("TOTK_INPUT");
-    return g_block != 1 && g_menu != 1 && mouse_sens_get() > 0 && !(in && !strcmp(in, "none")) && !menu_cursor_pointer();
+    return g_block != 1 && g_menu != 1 && (gameplay_tweaks_capture_needed() || mouse_sens_get() > 0) &&
+           !(in && !strcmp(in, "none")) && !menu_cursor_pointer();
 }
 
 void input_block(int on) {
+    if (on) gameplay_tweaks_reset();
     if (!on) __atomic_store_n(&g_block_closed, plat_now_ns(), __ATOMIC_RELEASE);
     plat_xchg32(&g_block, on ? 1 : 2);
     ikb_cursor_update();
@@ -733,6 +1129,7 @@ void input_block(int on) {
 // The in-game menu (ui/menu.cpp) blocks the game's input the same way: g_menu 0 closed, 1 open, 2 closed, waiting for
 // the release. The cursor is released while it is open, for the menu's mouse.
 void input_menu(int open) {
+    if (open) gameplay_tweaks_reset();
     if (!open) __atomic_store_n(&g_menu_closed, plat_now_ns(), __ATOMIC_RELEASE);
     plat_xchg32(&g_menu, open ? 1 : 2);
     if (!open) ikb_menu_closed();   // the capture before Esc comes back
@@ -759,7 +1156,10 @@ static int blocked(volatile int32_t *flag, volatile uint64_t *closed, const char
 
 void input_poll(uint64_t *buttons, int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry) {
     poll_merged(buttons, lx, ly, rx, ry);
-    if (!g_block && !g_menu) menu_cursor_poll(buttons);
+    // While quick load drives the game's load menu the pointer leaves it alone and the game gets only its presses
+    if (!g_block && !g_menu && !quicksave_busy()) menu_cursor_poll(buttons);
+    // A quick load under way goes on while the settings menu or a text entry opens: the held picture ends with it
+    if ((quicksave_busy() || (!g_block && !g_menu)) && quicksave_poll(buttons, lx, ly, rx, ry)) return;
     const int32_t axes[4] = {*lx, *ly, *rx, *ry};
     int text = blocked(&g_block, &g_block_closed, "text entry", *buttons, axes),
         menu = blocked(&g_menu, &g_menu_closed, "menu", *buttons, axes);
@@ -835,20 +1235,6 @@ int input_capture(int reset, int *id) {
 
 int input_rumble_triggers_enabled(void) {
     return cfg_bool("TOTK_RUMBLE_TRIGGERS");
-}
-
-int input_rumble(uint16_t low, uint16_t high, uint32_t ms) {
-    int ok = 0;
-    static int triggers = -1;
-    static unsigned seen;
-    if (triggers < 0 || seen != cfg_version()) seen = cfg_version(), triggers = input_rumble_triggers_enabled();
-    plat_mutex_lock(&lock);
-    if (state == 1 && pad && pad_rumble) {
-        ok = SDL_RumbleGamepad(pad, low, high, ms);
-        if (triggers) SDL_RumbleGamepadTriggers(pad, high, high, ms);   // unsupported pads return false: ignored
-    }
-    plat_mutex_unlock(&lock);
-    return ok;
 }
 
 uint32_t input_rumble_generation(void) {
@@ -931,21 +1317,120 @@ void input_motion_axes(const float a[3], const float g[3], double acc[3], double
     gyro[2] = g[1];
 }
 
-// Under lock: (re)enable the sensors when the open gamepad changed; 1 if it has both and they are on.
-static int sensors_ready(void) {
-    SDL_JoystickID id = SDL_GetGamepadID(pad);
+// Copy a controller name into cap bytes without splitting a UTF-8 sequence: a name cut mid-character would show as
+// garbage in the menu and be written to totk.ini the same way.
+static void copy_name(char *dst, size_t cap, const char *src) {
+    if (!src) src = "";
+    size_t n = strlen(src);
+    if (n >= cap) {
+        n = cap - 1;
+        while (n > 0 && ((unsigned char)src[n] & 0xC0) == 0x80) n--;   // back off to the start of the character
+    }
+    memcpy(dst, src, n);
+    dst[n] = 0;
+}
+
+// Under lock: the identity of src (motion_source) for the saved bias. Its name, plus a hash of SDL's serial when the pad
+// reports one (Switch and PlayStation pads report their Bluetooth address), so two controllers of one model keep their
+// own bias; the hash keeps the address out of totk.ini and the log, which players post with bug reports.
+static void pad_identity(SDL_Gamepad *src, char *dst, size_t cap) {
+    const char *name = SDL_GetGamepadName(src), *serial = SDL_GetGamepadSerial(src);
+    char id[160];
+    if (serial && *serial) {
+        uint32_t h = 2166136261u;   // FNV-1a
+        for (const char *c = serial; *c; c++) h = (h ^ (uint8_t)*c) * 16777619u;
+        snprintf(id, sizeof id, "%s #%08x", name ? name : "", h);
+    } else snprintf(id, sizeof id, "%s", name ? name : "");
+    // Steam's virtual pad takes the name of the controller behind it but sends Steam's corrected motion: its bias
+    // is its own (pad_bias_select would otherwise load the raw controller's)
+    // A controller read past Steam Input sends what Steam set it to: on the Steam Controller that is motion the
+    // controller already corrected, so the bias of the same controller read with Steam closed does not apply either
+    if (steam_virtual(src)) strncat(id, " (Steam Input)", sizeof id - strlen(id) - 1);
+    else if (steam_hidden_n && steam_hidden_id(SDL_GetGamepadID(src)))
+        strncat(id, " (under Steam)", sizeof id - strlen(id) - 1);
+    copy_name(dst, cap, id);
+}
+
+// Under lock, for each gamepad the sensor code sees (a first one, or one connected after another went away): the
+// previous controller's bias and any attempt still collecting from it are dropped, then the bias saved in totk.ini is
+// taken when gyro_bias_pad names this controller. It is taken with gyro_calibration off too: the switch only decides
+// whether motion_feed subtracts it, so turning the switch on mid-run applies the saved bias.
+static void pad_bias_select(SDL_Gamepad *src) {
+    char id[128];
+    pad_identity(src, id, sizeof id);
+    motion_bias_reset(motion_global());
+    calib_pad_name[0] = 0;
+    const char *saved = cfg_get("TOTK_GYRO_BIAS_PAD");
+    if (saved && !strcmp(saved, id)) {
+        motion_bias_load(motion_global());
+        copy_name(calib_pad_name, sizeof calib_pad_name, SDL_GetGamepadName(src));
+        rt_log("input: gyro bias loaded from totk.ini for %s", calib_pad_name);
+    }
+}
+
+// Under lock: the gamepad the sensors are read from, NULL without one. The open pad when it has a gyro and an
+// accelerometer, or when Steam hid nothing. Otherwise (Steam's virtual pad, which has neither) the first controller
+// Steam hid that has both, looked for once a RESCAN_MS; one without them is not opened again until it reconnects.
+static SDL_Gamepad *motion_source(void) {
+    static SDL_JoystickID rejected[8];
+    if (motion_extra && !SDL_GamepadConnected(motion_extra)) {
+        rt_log("input: \"%s\" (motion only) disconnected", SDL_GetGamepadName(motion_extra));
+        SDL_CloseGamepad(motion_extra);
+        motion_extra = NULL;
+    }
+    int pad_on = pad && SDL_GamepadConnected(pad);
+    // Newer Steam clients give the virtual pad motion too, but already corrected by Steam (and gated by the layout's
+    // gyro settings), so the bias calibrated on the raw controller would count twice and the camera drift. Under
+    // Steam Input the real controller's raw sensors come first; the virtual pad's are the fallback.
+    if (pad_on && has_motion(pad) && !(steam_hidden_n && steam_virtual(pad))) {
+        if (motion_extra) { SDL_CloseGamepad(motion_extra); motion_extra = NULL; }
+        return pad;
+    }
+    if (!motion_extra && steam_hidden_n && plat_now_ns() / 1000000u >= next_motion_scan) {
+        next_motion_scan = plat_now_ns() / 1000000u + RESCAN_MS;
+        int n = 0;
+        SDL_JoystickID *ids = SDL_GetGamepads(&n), skip = pad_on ? SDL_GetGamepadID(pad) : 0;
+        for (int i = 0; ids && i < n && !motion_extra; i++) {
+            int seen = 0;
+            for (int r = 0; r < 8; r++) seen |= rejected[r] == ids[i];
+            if (ids[i] == skip || seen || !steam_hidden_id(ids[i])) continue;
+            SDL_Gamepad *g = SDL_OpenGamepad(ids[i]);
+            if (g && has_motion(g)) {
+                motion_extra = g;
+                rt_log("input: motion from \"%s\" (%04x:%04x), the controller behind Steam Input's virtual gamepad",
+                       SDL_GetGamepadName(g), SDL_GetGamepadVendor(g), SDL_GetGamepadProduct(g));
+            } else {
+                if (g) SDL_CloseGamepad(g);
+                memmove(rejected + 1, rejected, sizeof rejected - sizeof rejected[0]);
+                rejected[0] = ids[i];
+            }
+        }
+        SDL_free(ids);
+    }
+    return motion_extra ? motion_extra : pad_on ? pad : NULL;
+}
+
+// Under lock: (re)enable the sensors when the motion source changed; 1 if it has both and they are on.
+static int sensors_ready(SDL_Gamepad *src) {
+    SDL_JoystickID id = SDL_GetGamepadID(src);
     if (id == sensor_pad) return sensor_ok;
     sensor_pad = id;
+    pad_bias_select(src);
     // Nothing drains the SDL event queue: no event per sample (the data still updates, SDL_SendJoystickSensor)
     SDL_SetEventEnabled(SDL_EVENT_GAMEPAD_SENSOR_UPDATE, false);
-    sensor_ok =SDL_GamepadHasSensor(pad, SDL_SENSOR_GYRO) && SDL_GamepadHasSensor(pad, SDL_SENSOR_ACCEL) &&
-                SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_GYRO, true) &&
-                SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_ACCEL, true);
-    if (sensor_ok) rt_log("input: motion sensors on (gyro %.0f Hz, accelerometer %.0f Hz)",
-                          (double)SDL_GetGamepadSensorDataRate(pad, SDL_SENSOR_GYRO),
-                          (double)SDL_GetGamepadSensorDataRate(pad, SDL_SENSOR_ACCEL));
+    sensor_ok = has_motion(src) &&
+                SDL_SetGamepadSensorEnabled(src, SDL_SENSOR_GYRO, true) &&
+                SDL_SetGamepadSensorEnabled(src, SDL_SENSOR_ACCEL, true);
+    if (sensor_ok) {
+        rt_log("input: motion sensors on (gyro %.0f Hz, accelerometer %.0f Hz)",
+               (double)SDL_GetGamepadSensorDataRate(src, SDL_SENSOR_GYRO),
+               (double)SDL_GetGamepadSensorDataRate(src, SDL_SENSOR_ACCEL));
+        motion_restart(motion_global());   // another controller: its own orientation, from its first reading
+    } else if (has_motion(src))   // after PR #1024: the SDL error, not "no sensors", when enabling them failed
+        rt_log("input: \"%s\" has a gyro and an accelerometer but SDL could not turn them on (%s): the six-axis sensor "
+               "reads a controller at rest", SDL_GetGamepadName(src), SDL_GetError());
     else rt_log("input: \"%s\" has no gyro and accelerometer: the six-axis sensor reads a controller at rest",
-                SDL_GetGamepadName(pad));
+                SDL_GetGamepadName(src));
     return sensor_ok;
 }
 
@@ -970,10 +1455,11 @@ static void motion_main(void *arg) {
         float a[3], g[3];
         int have = 0;
         plat_mutex_lock(&lock);
-        if (pad && SDL_GamepadConnected(pad)) {
+        SDL_Gamepad *src = motion_source();
+        if (src) {
             SDL_UpdateGamepads();
-            have = sensors_ready() && SDL_GetGamepadSensorData(pad, SDL_SENSOR_ACCEL, a, 3) &&
-                   SDL_GetGamepadSensorData(pad, SDL_SENSOR_GYRO, g, 3);
+            have = sensors_ready(src) && SDL_GetGamepadSensorData(src, SDL_SENSOR_ACCEL, a, 3) &&
+                   SDL_GetGamepadSensorData(src, SDL_SENSOR_GYRO, g, 3);
         }
         plat_mutex_unlock(&lock);
         if (!have || !input_motion_enabled()) continue;
@@ -983,16 +1469,54 @@ static void motion_main(void *arg) {
     }
 }
 
+// Under lock: the sensor thread, once; -1 when SDL is not running.
+static void motion_thread_start(void) {
+    if (!state) start();
+    if (motion_thread) return;
+    if (!input_motion_enabled()) rt_log("input: motion off (TOTK_MOTION=0); it can be turned on while the game runs");
+    if (state != 1) motion_thread = -1;
+    else {
+        if (!plat_thread_spawn(motion_main, NULL, "motion", 0)) rt_fatal("input: cannot start the motion thread");
+        motion_thread = 1;
+    }
+}
+
 void input_motion_start(void) {
     plat_mutex_lock(&lock);
-    if (!state) start();
-    if (!motion_thread) {
-        if (!input_motion_enabled()) rt_log("input: motion off (TOTK_MOTION=0); it can be turned on while the game runs");
-        if (state != 1) motion_thread = -1;
-        else {
-            if (!plat_thread_spawn(motion_main, NULL, "motion", 0)) rt_fatal("input: cannot start the motion thread");
-            motion_thread = 1;
-        }
+    motion_thread_start();
+    plat_mutex_unlock(&lock);
+}
+
+void input_motion_calibrate(void) {
+    plat_mutex_lock(&lock);
+    // The menu can run before the game starts the six-axis sensor (the title screen): the thread starts here then.
+    if (input_gyro_calibration_enabled() && input_motion_enabled()) motion_thread_start();
+    const char *why = NULL;
+    SDL_Gamepad *src = motion_thread == 1 ? motion_source() : NULL;
+    if (!input_gyro_calibration_enabled()) why = "gyro_calibration is off";
+    else if (!input_motion_enabled()) why = "motion is off (TOTK_MOTION=0)";
+    else if (motion_thread != 1) why = "no SDL gamepad support";
+    else if (!src) why = "no gamepad";
+    // sensors_ready here, not at the sensor thread's next look at a new pad: that look selects the pad's bias and
+    // would cancel the attempt that starts below.
+    else if (!sensors_ready(src)) why = "the gamepad has no gyro and accelerometer";
+    if (why) rt_log("input: calibrate gyro ignored: %s", why);
+    else {
+        char id[128];
+        pad_identity(src, id, sizeof id);
+        copy_name(calib_pad_name, sizeof calib_pad_name, SDL_GetGamepadName(src));
+        motion_calibrate_start(motion_global(), id, kern_now_ns());
+        rt_log("input: gyro calibration started on %s", calib_pad_name);
     }
     plat_mutex_unlock(&lock);
+}
+
+int input_gyro_calibration_enabled(void) { return motion_calibration_enabled(); }
+
+int input_motion_calib_state(char *pad, size_t cap) {
+    plat_mutex_lock(&lock);
+    int st = motion_thread == 1 ? motion_calib_poll(motion_global(), kern_now_ns()) : MOTION_CALIB_NONE;
+    if (pad && cap) snprintf(pad, cap, "%s", calib_pad_name);
+    plat_mutex_unlock(&lock);
+    return st;
 }

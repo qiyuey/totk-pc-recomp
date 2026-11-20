@@ -41,7 +41,8 @@ from installer.runner import Context  # noqa: E402
 from installer.steps import Fonts, all_steps  # noqa: E402
 from installer.guilogic import (DONE, FAILED, PENDING, RUNNING, SKIPPED, UI_LANGUAGE_LABELS,  # noqa: E402
                                 UI_LANGUAGES, Catalog, Form, Model, Process, amount, default_game_language,
-                                describe_event, parse_line, ui_language_for_langid, windows_ui_language)
+                                describe_event, parse_line, ui_language_for_langid, ui_language_for_locale,
+                                windows_ui_language)
 
 INSTALLED = ROOT / 'build' / 'install-test'
 FIXTURE = ROOT / 'build' / 'inst-gui' / 'e2e-install'
@@ -287,7 +288,9 @@ class CatalogTest(unittest.TestCase):
             self.assertEqual([i for i in ids if not cat.has(i)], [])
 
     def test_codes_become_names(self):
-        for lang, korean in (('en', 'Korean'), ('ru', 'Корейский'), ('pt-BR', 'Coreano'), ('zh-Hans', '韩语')):
+        for lang, korean in (('en', 'Korean'), ('ru', 'Корейский'), ('pt-BR', 'Coreano'), ('zh-Hans', '韩语'),
+                             ('de', 'Koreanisch'), ('fr', 'Coréen'), ('es', 'Coreano'), ('it', 'Coreano'),
+                             ('nl', 'Koreaans'), ('ja', '韓国語'), ('ko', '한국어')):
             cat = Catalog(lang)
             self.assertIn(korean, cat('warn.lang_needs_fonts', lang='ko'))
             self.assertNotIn(' ko ', cat('warn.lang_needs_fonts', lang='ko'))
@@ -303,7 +306,7 @@ class CatalogTest(unittest.TestCase):
         self.assertIn('36.4', cat('ui.log_space', need='36.4', free='1.0'))
         self.assertEqual(cat('no.such.id'), 'no.such.id')
         self.assertIn('a, b', cat('check.release_incomplete', paths=['a', 'b']))
-        cat.set_language('de')   # unknown language falls back to English
+        cat.set_language('xx')   # unknown language falls back to English
         self.assertEqual(cat.lang, 'en')
 
     def test_describe_and_amount(self):
@@ -321,12 +324,25 @@ class CatalogTest(unittest.TestCase):
     def test_windows_langid_picks_the_window_language(self):
         for langid, lang in ((0x0419, 'ru'), (0x0819, 'ru'), (0x0416, 'pt-BR'), (0x0816, 'en'),
                              (0x0804, 'zh-Hans'), (0x1004, 'zh-Hans'),
-                             (0x0404, 'en'), (0x0c04, 'en'), (0x1404, 'en'), (0x0409, 'en'), (0x0411, 'en')):
+                             (0x0404, 'zh-Hans'), (0x0c04, 'zh-Hans'), (0x1404, 'zh-Hans'), (0x0409, 'en'),
+                             (0x0407, 'de'), (0x0c07, 'de'), (0x040c, 'fr'), (0x0c0c, 'fr'), (0x0c0a, 'es'),
+                             (0x080a, 'es'), (0x0410, 'it'), (0x0413, 'nl'), (0x0813, 'nl'), (0x0411, 'ja'),
+                             (0x0412, 'ko'), (0x041d, 'en')):
             self.assertEqual(ui_language_for_langid(langid), lang, hex(langid))
 
     def test_chinese_window_starts_with_a_game_language_that_needs_no_shared_fonts(self):
         self.assertEqual(default_game_language('zh-Hans'), 'en-US')
         self.assertEqual(default_game_language('ru'), 'ru')
+        self.assertEqual(default_game_language('ja'), 'ja')
+        for ui in ('ko', 'pt-BR'):
+            self.assertEqual(default_game_language(ui), 'en-US')
+
+    def test_posix_locale_picks_the_window_language(self):
+        for loc, lang in (('ru_RU.UTF-8', 'ru'), ('pt_BR.UTF-8', 'pt-BR'), ('pt_PT.UTF-8', 'en'),
+                          ('zh_CN.UTF-8', 'zh-Hans'), ('zh_TW.UTF-8', 'zh-Hans'), ('zh_HK', 'zh-Hans'),
+                          ('de_AT.UTF-8', 'de'), ('fr_CA', 'fr'), ('ja_JP.UTF-8', 'ja'), ('ko_KR.UTF-8', 'ko'),
+                          ('nl', 'nl'), ('C.UTF-8', 'en'), ('', 'en'), ('sv_SE.UTF-8', 'en')):
+            self.assertEqual(ui_language_for_locale(loc), lang, loc)
 
 
 BREAK_CHILD = 'import time\nprint("ready", flush=True)\ntime.sleep(60)\n'
@@ -377,13 +393,19 @@ class DpiTest(unittest.TestCase):
         code = ('import tkinter\n'
                 'from installer import dpi, gui\n'
                 'root = tkinter.Tk()\n'
-                'print(dpi.awareness(), dpi.scale(), root.tk.call("tk", "scaling"), gui.PAD, gui.WRAP)\n'
+                'print(dpi.awareness(), dpi.scale(), root.tk.call("tk", "scaling"), gui.PAD, gui.WRAP, '
+                'root.winfo_screenwidth())\n'
                 'root.destroy()\n')
         r = subprocess.run([sys.executable, '-c', code], cwd=ROOT, capture_output=True, text=True, timeout=120)
         self.assertEqual(r.returncode, 0, r.stderr[-2000:])
-        awareness, scale, scaling, pad, wrap = r.stdout.split()
+        awareness, scale, scaling, pad, wrap, width = r.stdout.split()
         self.assertGreaterEqual(int(awareness), 1)   # 1 system aware, 2 per-monitor aware
-        self.assertAlmostEqual(float(scaling), float(scale) * 96 / 72, places=6)
+        # Tk's win/tkWinX.c TkWinDisplayChanged rounds the nominal screen width to whole millimetres.
+        # Its generic/tkCmds.c ScalingCmd converts that width back to pixels per point, so a 120 DPI display
+        # can report 120.118 DPI. Keep the exact comparison, accounting for that round trip.
+        width_mm = int(25.4 * int(width) / (float(scale) * 96) + 0.5)
+        expected_scaling = 25.4 * int(width) / (72 * width_mm)
+        self.assertAlmostEqual(float(scaling), expected_scaling, places=6)
         self.assertEqual((int(pad), int(wrap)), (round(14 * float(scale)), round(620 * float(scale))))
 
 

@@ -4,7 +4,7 @@ This repository switched from a single amended local FIX to ordinary focused com
 
 - Personal fork: https://github.com/qiyuey/totk-pc-recomp
 - `origin`: personal fork and default push destination.
-- Development branch: `main`, tracking `origin/main`.
+- Development branch: `dev`, tracking `origin/dev`; integrate from `upstream/dev`.
 - `upstream`: https://github.com/valentderah/totk-pc-recomp, the original project.
 - Pre-migration upstream baseline: `c38e0ca13d2bceb0590b195f69a010315913850d`.
 - Local recovery refs: `refs/backup/fork-migration-20261105/main` and `refs/backup/fork-migration-20261105/upstream-base`. Retain these locally; do not publish them as extra branches.

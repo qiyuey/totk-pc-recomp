@@ -30,6 +30,7 @@
 #define MIN_COMMAND_SIZE 512                // NVN_DEVICE_INFO_COMMAND_BUFFER_MIN_COMMAND_SIZE (nvn_api_core.c devinfo)
 #define MIN_CONTROL_SIZE 256                // NVN_DEVICE_INFO_COMMAND_BUFFER_MIN_CONTROL_SIZE
 #define CTL_PER_RECORDING 64                // control memory one recording is reported to use
+#define CTL_PER_CALL 24                     // control memory one called handle is reported to use (CallCommands)
 #define COPY_PAGE_SHIFT 16                  // recording copy index granularity (release_copies)
 
 static cmd_t *cmd_of(const Cpu *c) { return arg_p(c, 0); }
@@ -141,10 +142,14 @@ static void pool_drain(void) {
 // system-managed page file, so the same request succeeds a moment later, and a stall of some frames is better than
 // ending the game. Frees the pooled buffers first. NULL only after about 30 s without memory; the caller ends the game.
 // Never called with a lock held.
+static void big_drain(void);
+
 static void *realloc_wait(void *old, size_t n, const char *what) {
     void *p = realloc(old, n);
     if (p) return p;
     pool_drain();
+    big_drain();
+    rt_oom_request();   // the Vulkan back end gives memory back at its next submit (oom.c)
     static uint32_t reports;
     int report = __atomic_fetch_add(&reports, 1, __ATOMIC_RELAXED) < 8;
     if (report) {
@@ -406,8 +411,11 @@ void nvn_pins_stats(uint64_t *live, uint64_t *freed) {
 // adding control memory again releases the copies recorded there without walking every live copy. 4 KiB pages cost
 // about 500 lookups per AddControlMemory under the exclusive lock (1.4.3 field: 53 calls a frame, 2 MiB ranges, 3.7
 // copies per page), and the recording threads waited on it.
-// deferred: 0 unknown, 1 none, 2 some; pins: texture pins its ops name, counted in their refs (pin_refs)
-typedef struct { uint64_t magic, bytes, made_at, used_at, deferred, pins; } copy_prefix;
+// deferred: 0 unknown, 1 none, 2 some; pins: texture pins its ops name, counted in their refs; pin_v: those pins, in
+// record order, or NULL (then pin_refs walks the records); cap: bytes of the block from the large-block cache
+// (copy_block), 0 for a plain heap block; hw: the recording's command memory as the real driver counts it (set at
+// EndRecording), what CopyCommands of it adds to nvnCommandBufferGetCommandMemoryUsed (inline_recording)
+typedef struct { uint64_t magic, bytes, made_at, used_at, deferred, pins, cap, hw; const tex_t **pin_v; } copy_prefix;
 _Static_assert(sizeof(copy_prefix) % 8 == 0, "records stay 8-byte aligned");
 typedef struct { uintptr_t lo, hi; uint8_t *copy; } cmd_copy;
 typedef struct { cmd_copy *v; uint32_t n, cap; } copy_bucket;
@@ -429,15 +437,117 @@ static void zombie_add(copy_prefix *pf) {   // copy_lock held
     zombies[nzombies++] = pf;
 }
 
-static void copy_free(copy_prefix *pf) {   // copy_lock held
-    if (pf->pins) pin_refs((const uint8_t *)(pf + 1), -1);
+// Blocks of large copies are kept for the next ones. 1.4.3 makes two copies of 0.5-2 MiB a frame (the per-frame
+// recordings that inline many others); above the heap's direct-allocation threshold (about 512 KiB) every malloc mapped
+// fresh zero-filled pages and every free unmapped them, so the copy ran at half the speed of a small one and the free
+// held copy_lock for tens of microseconds. A block is reused for a copy that fills at least half of it.
+#define BIG_MIN ((size_t)256 << 10)        // smaller blocks come from the heap and go back to it
+#define BIG_MAX ((size_t)16 << 20)         // a larger block is never kept
+#define BIG_SLOTS 8
+static PlatMutex big_lock = PLAT_MUTEX_INIT;   // lock order: copy_lock, then big_lock
+static struct { copy_prefix *p; size_t cap; } big[BIG_SLOTS];
+static uint32_t nbig;
+
+static void big_drain(void) {
+    plat_mutex_lock(&big_lock);
+    while (nbig) free(big[--nbig].p);
+    plat_mutex_unlock(&big_lock);
+}
+
+// A block for a copy of n bytes after its prefix; prefix.cap says where it goes back (copy_block_free). wait: a failed
+// allocation waits for memory (realloc_wait), which is never done with a lock held; else it ends the game at once.
+static copy_prefix *copy_block(size_t n, int wait, const char *what) {
+    size_t total = sizeof(copy_prefix) + n, cap = 0;
+    copy_prefix *pf = NULL;
+    if (total >= BIG_MIN && total <= BIG_MAX) {
+        plat_mutex_lock(&big_lock);
+        uint32_t best = BIG_SLOTS;
+        for (uint32_t i = 0; i < nbig; i++)
+            if (big[i].cap >= total && big[i].cap / 2 <= total && (best == BIG_SLOTS || big[i].cap < big[best].cap))
+                best = i;
+        if (best < BIG_SLOTS) {
+            pf = big[best].p;
+            cap = big[best].cap;
+            big[best] = big[--nbig];
+        }
+        plat_mutex_unlock(&big_lock);
+        if (!pf) cap = (total + total / 8 + 0xffff) & ~(size_t)0xffff;   // room for the next frame's slightly larger one
+    }
+    if (!pf) pf = wait ? realloc_wait(NULL, cap ? cap : total, what) : malloc(cap ? cap : total);
+    if (!pf) rt_fatal("nvn: %s allocation (%zu bytes)", what, cap ? cap : total);
+    pf->cap = cap;
+    return pf;
+}
+
+static void copy_block_free(copy_prefix *pf) {
+    size_t cap = pf->cap;
+    if (cap) {
+        plat_mutex_lock(&big_lock);
+        if (nbig < BIG_SLOTS) {
+            big[nbig].p = pf;
+            big[nbig++].cap = cap;
+            pf = NULL;
+        } else {
+            uint32_t small = 0;
+            for (uint32_t i = 1; i < nbig; i++)
+                if (big[i].cap < big[small].cap) small = i;
+            if (big[small].cap < cap) {
+                copy_prefix *drop = big[small].p;
+                big[small].p = pf;
+                big[small].cap = cap;
+                pf = drop;
+            }
+        }
+        plat_mutex_unlock(&big_lock);
+    }
     free(pf);
 }
 
-static void zombie_sweep(uint64_t replayed) {   // copy_lock held
+// Counts (delta 1) or uncounts (-1) the pins a copy names: from its list, without walking its records. A copy of a
+// per-frame recording is 0.5-2 MiB of records naming a few pins; walking them again at every free cost about 40 us.
+static void copy_pins_ref(const copy_prefix *pf, int delta) {
+    if (!pf->pins) return;
+    if (!pf->pin_v) {
+        pin_refs((const uint8_t *)(pf + 1), delta);
+        return;
+    }
+    uint64_t now = __atomic_load_n(&nsubmits, __ATOMIC_RELAXED);
+    for (uint64_t i = 0; i < pf->pins; i++) pin_ref(pf->pin_v[i], delta, now);
+}
+
+// A copy in no map and no zombie list: nothing else can reach it, so copy_lock need not be held.
+static void copy_free(copy_prefix *pf) {
+    copy_pins_ref(pf, -1);
+    free((void *)pf->pin_v);
+    copy_block_free(pf);
+}
+
+// Copies retired under copy_lock and freed after it is released: the frees, the unpinning walk over their records and
+// the large blocks kept the lock exclusive for most of release_copies, while the game's other recording threads waited
+// for it in copy_touch (1.4.3 town: three threads, 0.6 ms a frame of waiting).
+typedef struct { copy_prefix **v; uint32_t n, cap; } dead_list;
+static __thread dead_list dead;
+
+static void dead_add(copy_prefix *pf) {
+    if (dead.n == dead.cap) {
+        uint32_t cap = dead.cap ? dead.cap * 2 : 256;
+        copy_prefix **v = realloc(dead.v, sizeof *v * cap);
+        if (!v) { copy_free(pf); return; }   // out of memory: free it here, under the lock, as before
+        dead.v = v;
+        dead.cap = cap;
+    }
+    dead.v[dead.n++] = pf;
+}
+
+static void dead_free(void) {   // copy_lock not held
+    for (uint32_t i = 0; i < dead.n; i++) copy_free(dead.v[i]);
+    dead.n = 0;
+}
+
+static void zombie_sweep(uint64_t replayed) {   // copy_lock held; the swept copies go to the dead list
     for (uint32_t i = 0; i < nzombies;) {
         if (zombies[i]->used_at <= replayed) {
-            copy_free(zombies[i]);
+            dead_add(zombies[i]);
             zombies[i] = zombies[--nzombies];
         } else {
             i++;
@@ -465,11 +575,12 @@ uint64_t nvn_handle_bytes(uint64_t handle) {
 }
 
 // Marks a live copy used by submission now; its size from OP_BEGIN to OP_END inclusive.
-static uint64_t copy_touch(uint64_t handle, uint64_t now, const char *what) {
+static uint64_t copy_touch(uint64_t handle, uint64_t now, const char *what, uint64_t *hw) {
     plat_mutex_lock_shared(&copy_lock);
     copy_prefix *pf = copy_find(handle);
     uint64_t bytes = 0;
     if (pf) __atomic_store_n(&pf->used_at, now, __ATOMIC_RELAXED), bytes = pf->bytes;
+    if (hw) *hw = pf ? pf->hw : 0;
     plat_mutex_unlock_shared(&copy_lock);
     if (!pf) rt_fatal("nvn: %s: command handle %#llx is not a live recording (released or never recorded)", what,
                       (unsigned long long)handle);
@@ -477,13 +588,16 @@ static uint64_t copy_touch(uint64_t handle, uint64_t now, const char *what) {
 }
 
 // The recording [p, p + n), OP_BEGIN to OP_END (the recording buffer is one block: recording emits no OP_JUMP), copied
-// into one host block of its exact size. One allocation and one copy: growing the copy record by record cost the
-// game's main thread about 1 ms a frame in reallocations and small copies (1.4.3, field).
+// into one host block (copy_block: its exact size, or a kept large block). One allocation and one copy: growing the
+// copy record by record cost the game's main thread about 1 ms a frame in reallocations and small copies (1.4.3,
+// field). The pins the records name are counted and listed (copy_prefix.pin_v) on the way.
 static uint8_t *flatten_recording(const uint8_t *p, size_t n) {
-    uint8_t *out = realloc_wait(NULL, sizeof(copy_prefix) + n, "command copy");
-    if (!out) rt_fatal("nvn: command copy allocation");
+    copy_prefix *block = copy_block(n, 1, "command copy");
+    uint8_t *out = (uint8_t *)block;
     memcpy(out + sizeof(copy_prefix), p, n);
+    static __thread struct { const tex_t **v; uint64_t cap; } named;   // the pins of this recording, reused
     uint64_t pins_named = 0;
+    int listed = 1;   // 0 after a failed growth: the copy goes without a list
     for (size_t at = 0;;) {   // the records stay checked: a corrupt one stops here, not in the replay
         op_hdr h;
         memcpy(&h, p + at, sizeof h);
@@ -493,6 +607,14 @@ static uint8_t *flatten_recording(const uint8_t *p, size_t n) {
         const tex_t *pinned[9];
         int k = op_pins(h.op, out + sizeof(copy_prefix) + at + 8, pinned);
         for (int i = 0; i < k; i++) pin_ref(pinned[i], 1, 0);
+        if (k && listed && pins_named + (uint64_t)k > named.cap) {
+            uint64_t cap = named.cap ? named.cap * 2 : 64;
+            while (cap < pins_named + (uint64_t)k) cap *= 2;
+            const tex_t **v = realloc((void *)named.v, sizeof *v * cap);
+            if (v) named.v = v, named.cap = cap;
+            else listed = 0;
+        }
+        if (k && listed) memcpy((void *)(named.v + pins_named), pinned, sizeof *pinned * (size_t)k);
         pins_named += (uint64_t)k;
         at += h.size;
         if (h.op == OP_END) {
@@ -500,7 +622,10 @@ static uint8_t *flatten_recording(const uint8_t *p, size_t n) {
             break;
         }
     }
-    *(copy_prefix *)out = (copy_prefix){.magic = COPY_MAGIC, .bytes = n, .pins = pins_named};
+    const tex_t **pin_v = NULL;
+    if (pins_named && listed && (pin_v = malloc(sizeof *pin_v * pins_named)))
+        memcpy((void *)pin_v, (const void *)named.v, sizeof *pin_v * pins_named);
+    *block = (copy_prefix){.magic = COPY_MAGIC, .bytes = n, .pins = pins_named, .cap = block->cap, .pin_v = pin_v};
     return out + sizeof(copy_prefix);
 }
 
@@ -550,7 +675,7 @@ static void release_copies(uintptr_t lo, uintptr_t hi) {
             copy_bytes -= pf->bytes;
             pf->magic = 0;
             if (pf->used_at > replayed) zombie_add(pf);   // a queued submission still reads it
-            else copy_free(pf);
+            else dead_add(pf);
             b->v[i] = b->v[--b->n];
         }
         if (!b->n) {
@@ -560,6 +685,7 @@ static void release_copies(uintptr_t lo, uintptr_t hi) {
         }
     }
     plat_mutex_unlock(&copy_lock);
+    dead_free();
 }
 
 // ---------- CommandBuffer: object and memory
@@ -608,6 +734,9 @@ NVN_API(nvnCommandBufferAddCommandMemory) {
     const pool_t *p = arg_p(c, 1);
     o->cmd_base = (uintptr_t)(p ? p->mem : NULL) + (uintptr_t)arg_x(c, 2);
     o->game_size = arg_x(c, 3);
+    // Memory added while recording (the out-of-memory callback): hw_start moves with hw_used, so hw_used - hw_start
+    // stays the whole recording's size at EndRecording (unsigned wrap-around cancels out).
+    if (o->recording) o->hw_start -= o->hw_used;
     o->cmd_used = 0;
     o->hw_used = 0;
 }
@@ -658,6 +787,7 @@ NVN_API(nvnCommandBufferEndRecording) {
     uintptr_t lo = (uintptr_t)o->ctl + (o->ctl_used < o->ctl_size ? o->ctl_used : 0);
     uintptr_t hi = o->ctl ? lo + 1 : 0;
     o->ctl_used += CTL_PER_RECORDING;
+    ((copy_prefix *)copy - 1)->hw = o->hw_used - o->hw_start;   // BEGIN and END excluded; what a copy of it adds
     copy_add(lo, hi, copy);
     ret_x(c, (uintptr_t)copy);
 }
@@ -666,32 +796,45 @@ NVN_API(nvnCommandBufferIsRecording) { ret_x(c, cmd_of(c)->recording != 0); }
 
 // The called recording is copied into the caller at the call position: the game recycles command memory in small steps,
 // so a handle may be gone by the time the caller is submitted. Deferred binds stay deferred. A copy is OP_BEGIN, its
-// records and OP_END (flatten_recording checked them), so the records go over as one block; usage grows by the same
+// records and OP_END (flatten_recording checked them), so the records go over as one block; cmd_used grows by the same
 // bytes as record by record.
-static void inline_recording(cmd_t *o, uint64_t handle, const char *what) {
+// nvnCommandBufferGetCommandMemoryUsed grows as on the real driver: a call by nothing (the driver puts a call in
+// control memory, nvnCommandBufferCallCommands) and a copy by the copied recording's hardware size (copy_prefix.hw), not by our record bytes. The
+// game measures small command sets it records and sizes renderer memory pools from them: MacNativeGames commit 6909dbb7
+// measured one recording with two uniform buffer binds and one CallCommands at 40 bytes on the original driver
+// (Ryujinx, 1.0.0) and 88 in their port, whose larger sizes doubled a renderer's pool and ran its private heap dry
+// (NULL write crash near Zora's Domain). 1.4.3 calls in recordings it queries every frame (copies were not seen).
+static void inline_recording(cmd_t *o, uint64_t handle, int call) {
+    const char *what = call ? "CallCommands" : "CopyCommands";
     if (!handle) rt_fatal("nvn: %s with a null handle", what);
-    uint64_t bytes = copy_touch(handle, __atomic_load_n(&nsubmits, __ATOMIC_RELAXED), what);
+    uint64_t hw = 0;
+    uint64_t bytes = copy_touch(handle, __atomic_load_n(&nsubmits, __ATOMIC_RELAXED), what, &hw);
     if (bytes <= 16) return;
     size_t body = (size_t)bytes - 16;
     cmd_reserve(o, body);
     memcpy(o->cur, (const uint8_t *)(uintptr_t)handle + 8, body);
     o->cur += body;
     o->cmd_used += body;
-    o->hw_used += body;
+    if (!call) o->hw_used += hw;
     o->last_rec = 0;
 }
 // void nvnCommandBuffer{Call,Copy}Commands(NVNcommandBuffer *cmd, int n, const NVNcommandHandle *handles)
+// A call takes control memory instead: the game's inline copy of the driver's call (1.4.3 main+0x2d33a4, in the
+// function that measures a renderer's command set) writes one 24-byte control entry per segment of the called handle,
+// after an 8-byte block header. The game reads a buffer whose command and control usage are both 0 as empty
+// (main+0x83f8c clears bit 0 of its flags), so a buffer that only called recordings must show control usage.
 NVN_API(nvnCommandBufferCallCommands) {
     cmd_t *o = cmd_of(c);
     int n = (int)arg_x(c, 1);
     const uint64_t *h = arg_p(c, 2);
-    for (int i = 0; i < n; i++) inline_recording(o, h[i], "CallCommands");
+    for (int i = 0; i < n; i++) inline_recording(o, h[i], 1);
+    if (n > 0) o->ctl_used += CTL_PER_CALL * (size_t)n;
 }
 NVN_API(nvnCommandBufferCopyCommands) {
     cmd_t *o = cmd_of(c);
     int n = (int)arg_x(c, 1);
     const uint64_t *h = arg_p(c, 2);
-    for (int i = 0; i < n; i++) inline_recording(o, h[i], "CopyCommands");
+    for (int i = 0; i < n; i++) inline_recording(o, h[i], 0);
 }
 
 // ---------- CommandBuffer: commands with CPU-visible results (performed by the back end in GPU order)
@@ -1162,7 +1305,7 @@ static int resolve_deferred(const uint8_t *p, int depth) {   // returns the numb
 
 void nvn_submit_prepare(const uint64_t *handles, int n) {
     uint64_t now = __atomic_add_fetch(&nsubmits, 1, __ATOMIC_RELAXED);
-    for (int i = 0; i < n; i++) copy_touch(handles[i], now, "QueueSubmitCommands");
+    for (int i = 0; i < n; i++) copy_touch(handles[i], now, "QueueSubmitCommands", NULL);
     for (int i = 0; i < n; i++) resolve_deferred((const uint8_t *)(uintptr_t)handles[i], 0);
 }
 
@@ -1182,11 +1325,14 @@ void nvn_submit_prepare_async(const uint64_t *handles, uint64_t *out, int n) {
         }
         out[i] = handles[i];
         if (pf->used_at > replayed && pf->used_at != now && pf->deferred != 1) {
-            size_t sz = sizeof *pf + pf->bytes;
-            copy_prefix *cl = malloc(sz);
-            if (!cl) rt_fatal("nvn: out of memory (recording clone, %zu bytes)", sz);
-            memcpy(cl, pf, sz);
-            if (cl->pins) pin_refs((const uint8_t *)(cl + 1), 1);
+            copy_prefix *cl = copy_block(pf->bytes, 0, "recording clone");   // copy_lock held
+            size_t cap = cl->cap;
+            memcpy(cl, pf, sizeof *pf + pf->bytes);
+            cl->cap = cap;
+            cl->pin_v = NULL;
+            if (pf->pin_v && (cl->pin_v = malloc(sizeof *cl->pin_v * pf->pins)))
+                memcpy((void *)cl->pin_v, (const void *)pf->pin_v, sizeof *cl->pin_v * pf->pins);
+            copy_pins_ref(cl, 1);
             cl->magic = 0;   // not a live handle: the game never sees it
             cl->used_at = now;
             zombie_add(cl);
@@ -1197,6 +1343,7 @@ void nvn_submit_prepare_async(const uint64_t *handles, uint64_t *out, int n) {
         }
     }
     plat_mutex_unlock(&copy_lock);
+    dead_free();
     for (int i = 0; i < n; i++) {
         int nd = resolve_deferred((const uint8_t *)(uintptr_t)out[i], 0);
         if (out[i] == handles[i]) ((copy_prefix *)(uintptr_t)out[i] - 1)->deferred = nd ? 2 : 1;
