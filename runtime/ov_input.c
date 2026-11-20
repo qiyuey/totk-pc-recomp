@@ -188,23 +188,20 @@ static void once(volatile int32_t *flag, const char *fmt, uint32_t v) {
     if (!plat_xchg32(flag, 1)) rt_log(fmt, v);
 }
 
-// Strength is applied once before SDL: 0..100%, with 100%=5x for Switch content.
+// Strength is applied once before SDL, with 100% preserving the game amplitudes.
 // The legacy RUMBLE_CURVE key is accepted by config but no longer shapes output.
-static float rumble_strength = 5.0f;
+static float clamp01(float v) { return v > 0 ? (v < 1 ? v : 1) : 0; }   // NaN -> 0
+static float rumble_strength = 1.0f;
 static volatile int32_t rumble_cfg_logged;
 static unsigned rumble_cfg_seen = ~0u;
-static float cfg_float(const char *name, float lo, float hi) {
-    double v = cfg_double(name);
-    return (float)(v < lo ? lo : v > hi ? hi : v);
-}
 static void rumble_cfg(void) {
     unsigned v = cfg_version();
     if (v == rumble_cfg_seen) return;
     rumble_cfg_seen = v;
-    rumble_strength = 5.0f * cfg_float("TOTK_RUMBLE_STRENGTH", 0, 100) / 100;
+    rumble_strength = clamp01((float)(cfg_double("TOTK_RUMBLE_STRENGTH") / 100.0));
     int trig = input_rumble_triggers_enabled();
     if (!plat_xchg32(&rumble_cfg_logged, 1))
-        rt_log("hid: rumble strength %.0f%% (%.2fx), triggers %s", rumble_strength * 20, rumble_strength, trig ? "on" : "off");
+        rt_log("hid: rumble strength %.0f%% (%.2fx), triggers %s", rumble_strength * 100, rumble_strength, trig ? "on" : "off");
 }
 
 static uint32_t pad_style_index(void) { return ov_handheld() ? STYLE_INDEX_HANDHELD : STYLE_INDEX_FULL_KEY; }
@@ -295,7 +292,6 @@ static PlatThread *vib_thread;
 static volatile int32_t vib_thread_id, vib_shutdown_started;
 static int vib_allowed = 1;                                                  // vib_lock: PermitVibration
 
-static float clamp01(float v) { return v > 0 ? (v < 1 ? v : 1) : 0; }   // NaN -> 0
 // The owner copies a complete raw stereo snapshot under vib_lock, then releases
 // it before controller I/O. New values wake it immediately; only failure, expiry
 // and constant-effect renewal use timers. Readback remains the game's raw value.
@@ -310,10 +306,8 @@ static void rumble_update(uint64_t now) {
     }
     int on = 0;
     for (int side = 0; side < 2; ++side) {
-        float low = clamp01(v[side].amp_low), high = clamp01(v[side].amp_high);
-        float peak = fmaxf(low, high) * rumble_strength;
-        float scale = rumble_strength / fmaxf(1.0f, peak);
-        v[side].amp_low = low * scale; v[side].amp_high = high * scale;
+        v[side].amp_low = clamp01(v[side].amp_low * rumble_strength);
+        v[side].amp_high = clamp01(v[side].amp_high * rumble_strength);
         if (v[side].amp_low || v[side].amp_high) on = 1;
         else v[side] = vib_neutral;   // silent bands need no frequency changes on the wire
     }

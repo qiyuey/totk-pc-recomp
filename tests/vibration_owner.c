@@ -9,7 +9,7 @@
 static PlatMutex capture_lock = PLAT_MUTEX_INIT;
 static PlatEvent entered, release_io;
 static int block_io, failures, calls, accepted, zero_seen;
-static volatile int32_t ready=1, generation=1, config_version=1, strength=20;
+static volatile int32_t ready=1, generation=1, config_version=1, strength=100;
 static VibrationValue output[2];
 uint64_t kern_now_ns(void) { return SDL_GetTicksNS()+1; }
 void rt_log(const char *fmt, ...) { (void)fmt; }
@@ -27,6 +27,7 @@ int input_rumble_service(uint32_t *epoch) {
 void input_rumble_shutdown_device(void) { plat_mutex_lock(&capture_lock);memset(output,0,sizeof output);++accepted;plat_mutex_unlock(&capture_lock); }
 int ov_handheld(void) { return 0; }
 int input_rumble_hd_epoch(float la,float lf,float lh,float lhf,float ra,float rf,float rh,float rhf,uint32_t ms,uint32_t epoch) {
+    assert(la>=0&&la<=1&&lh>=0&&lh<=1&&ra>=0&&ra<=1&&rh>=0&&rh<=1);
     (void)ms;VibrationValue v[2]={{la,lf,lh,lhf},{ra,rf,rh,rhf}};
     plat_mutex_lock(&capture_lock);++calls;int blocked=block_io;plat_mutex_unlock(&capture_lock);
     if(blocked) {plat_event_set(&entered);plat_event_wait(&release_io);}
@@ -63,9 +64,15 @@ int main(void) {
     puts("PASS: stereo batch, 10000 nonblocking publications during backend stall, latched Stop before new activation");
     plat_mutex_lock(&capture_lock);failures=2;plat_mutex_unlock(&capture_lock);
     batch(.3f,.4f);wait_output(.3f,.4f);
-    plat_xchg32(&strength,100);plat_inc32(&config_version);batch(.2f,.4f);wait_output(1,1);
+    const float previous_overflow = 103.0f / 255.0f;
+    batch(previous_overflow,1);wait_output(previous_overflow,1);
+    plat_mutex_lock(&capture_lock);
+    assert(output[0].amp_low==previous_overflow&&output[1].amp_low==1);
+    plat_mutex_unlock(&capture_lock);
+    plat_xchg32(&strength,50);plat_inc32(&config_version);batch(.2f,.4f);wait_output(.1f,.2f);
     assert(vib_last[0].amp_low==.2f&&vib_last[1].amp_low==.4f);
-    plat_xchg32(&strength,20);plat_inc32(&config_version);batch(.2f,.3f);wait_output(.2f,.3f);
+    plat_xchg32(&strength,0);plat_inc32(&config_version);batch(.3f,.4f);wait_output(0,0);
+    plat_xchg32(&strength,100);plat_inc32(&config_version);batch(.2f,.3f);wait_output(.2f,.3f);
     Cpu permission={0};permission.x[0]=0;ov_vib_permit(&permission);wait_output(0,0);
     permission.x[0]=1;ov_vib_permit(&permission);SDL_Delay(15);
     plat_mutex_lock(&capture_lock);assert(output[0].amp_low==0&&output[1].amp_low==0);plat_mutex_unlock(&capture_lock);

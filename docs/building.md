@@ -64,7 +64,7 @@ Missing custom headers or libraries stop the build instead of silently using sto
 Game vibration keeps the left/right low/high amplitudes and frequencies through `ov_input.c`, `input.c`, and
 `SDL_RumbleGamepadFrequenciesEx`. The custom SDL driver handles conventional pads. The runtime retains upstream
 controller discovery, polling, thread locking and optional trigger effects. Application strength defaults to 100%,
-which requests 5x amplitude before shared per-side saturation. Set `rumble_strength` in `totk.ini` to override it.
+which preserves the original amplitude. Set `rumble_strength` in `totk.ini` to attenuate it.
 The legacy curve key has no effect. SDL receives the final normalized amplitudes without another gain.
 
 Scalar and stereo batch requests now publish to an event-driven owner; the guest

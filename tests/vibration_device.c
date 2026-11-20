@@ -21,7 +21,7 @@ static void emit(float a,float b) {
 }
 int main(int argc,char **argv) {
     if(argc!=2||strcmp(argv[1],"--play")) {puts("Usage: vibration_device --play (synthetic low-amplitude test)");return 2;}
-    cfg_init();cfg_set("TOTK_RUMBLE_STRENGTH","20");cfg_set("TOTK_PAD_LAYOUT","auto");
+    cfg_init();cfg_set("TOTK_RUMBLE_STRENGTH","100");cfg_set("TOTK_PAD_LAYOUT","auto");
     SDL_SetHint(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT,"0x057e/0x2069");
     SDL_SetHint("SDL_JOYSTICK_HIDAPI_RUMBLE_TRACE","1");SDL_SetLogPriority(SDL_LOG_CATEGORY_INPUT,SDL_LOG_PRIORITY_INFO);
     uint32_t gen;
@@ -57,6 +57,10 @@ float cam_speed_applied(void) {return 1;}
 int menu_cursor_pointer(void) {return 0;}
 int menu_cursor_shortcut(void) {return -1;}
 int menu_cursor_map(void) {return 0;}
+int menu_cursor_dialogue(void) {return 0;}
+int menu_cursor_strip(void) {return 0;}
+int menu_cursor_camera(void) {return 0;}
+int menu_cursor_menu(void) {return 0;}
 void menu_cursor_poll(uint64_t *b) {(void)b;}
 int menu_is_open(void) {return 0;}
 void menu_toggle(void) {}
@@ -68,3 +72,28 @@ void input_direct_mouse_radial(int32_t x,int32_t y,float s,float c[2],int32_t o[
 void input_direct_mouse_row(int32_t x,float s,uint64_t n,InputMouseRow *r,int32_t o[2]) {(void)x;(void)s;(void)n;(void)r;o[0]=o[1]=0;}
 MotionFusion *motion_global(void) {return NULL;}
 void motion_feed(MotionFusion *m,const double a[3],const double g[3],uint64_t t) {(void)m;(void)a;(void)g;(void)t;}
+int motion_calibration_enabled(void) {return 0;}
+void motion_calibrate_start(MotionFusion *m,const char *pad,uint64_t t) {(void)m;(void)pad;(void)t;}
+int motion_calib_poll(MotionFusion *m,uint64_t t) {(void)m;(void)t;return 0;}
+void motion_bias_reset(MotionFusion *m) {(void)m;}
+void motion_bias_load(MotionFusion *m) {(void)m;}
+void motion_restart(MotionFusion *m) {(void)m;}
+int freecam_available(void) {return 0;}
+int freecam_state(void) {return FREECAM_OFF;}
+void freecam_cycle(void) {}
+void freecam_pad(const FreecamPad *p) {(void)p;}
+void freecam_speed_click(int faster) {(void)faster;}
+int quicksave_on(void) {return 0;}
+void quicksave_keys(uint8_t *down,int act) {(void)down;(void)act;}
+void quicksave_request(int load) {(void)load;}
+int quicksave_poll(uint64_t *b,int32_t *lx,int32_t *ly,int32_t *rx,int32_t *ry) {
+    (void)b;(void)lx;(void)ly;(void)rx;(void)ry;return 0;
+}
+int quicksave_busy(void) {return 0;}
+int gameplay_tweaks_capture_needed(void) {return 0;}
+void gameplay_tweaks_reset(void) {}
+int gameplay_tweaks_strip_wheel(uint64_t buttons) {(void)buttons;return 0;}
+void gameplay_tweaks_apply(uint64_t frame,int active,uint64_t *b,int32_t *lx,int32_t *ly,int32_t *rx,int32_t *ry) {
+    (void)frame;(void)active;(void)b;(void)lx;(void)ly;(void)rx;(void)ry;
+}
+int romfs_shaped_prompts_ready(const char *folder,unsigned w,unsigned h) {(void)folder;(void)w;(void)h;return 0;}
